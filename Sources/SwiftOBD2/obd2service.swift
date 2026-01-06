@@ -98,32 +98,72 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// - Parameter preferedProtocol: The optional OBD2 protocol to use (if supported).
     /// - Returns: Information about the connected vehicle (`OBDInfo`).
     /// - Throws: Errors that might occur during the connection process.
-    public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
-        let startTime = CFAbsoluteTimeGetCurrent()
-        obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
-        
-        do {
-            obdDebug("Connecting to adapter...", category: .connection)
-            try await elm327.connectToAdapter(timeout: timeout)
-            
-            obdDebug("Initializing adapter...", category: .connection)
-            try await elm327.adapterInitialization()
-            
-            obdDebug("Initializing vehicle connection...", category: .connection)
-            let vehicleInfo = try await initializeVehicle(preferedProtocol)
+   public func startConnection(
+    preferedProtocol: PROTOCOL? = nil,
+    timeout: TimeInterval = 7
+) async throws -> OBDInfo {
 
-            let duration = CFAbsoluteTimeGetCurrent() - startTime
-            OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
-            obdInfo("Successfully connected to vehicle: \(vehicleInfo.vin ?? "Unknown")", category: .connection)
+    let startTime = CFAbsoluteTimeGetCurrent()
+    obdInfo("Starting BLE connection (auto-scan)", category: .connection)
 
-            return vehicleInfo
-        } catch {
-            let duration = CFAbsoluteTimeGetCurrent() - startTime
-            OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
-            obdError("Connection failed: \(error.localizedDescription)", category: .connection)
-            throw OBDServiceError.adapterConnectionFailed(underlyingError: error) // Propagate
+    do {
+        // 🔹 If Bluetooth, explicitly scan + auto-connect
+        if connectionType == .bluetooth {
+            try await connectBLEAutomatically(timeout: timeout)
         }
+
+        obdDebug("Initializing adapter...", category: .connection)
+        try await elm327.adapterInitialization()
+
+        obdDebug("Initializing vehicle connection...", category: .connection)
+        let vehicleInfo = try await initializeVehicle(preferedProtocol)
+
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
+
+        return vehicleInfo
+    } catch {
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
+        throw OBDServiceError.adapterConnectionFailed(underlyingError: error)
     }
+}
+
+	private func connectBLEAutomatically(timeout: TimeInterval) async throws {
+    guard let bleManager = elm327CommAsBLEManager else {
+        throw OBDServiceError.noAdapterFound
+    }
+
+    obdDebug("Scanning for BLE OBD adapters...", category: .connection)
+
+    // Start scanning
+    try await bleManager.scanForPeripherals(
+        services: BLEPeripheralScanner.supportedServices
+    )
+
+    // Wait for first compatible peripheral
+    let peripheral = try await bleManager.waitForFirstPeripheral(timeout: timeout)
+
+    obdInfo(
+        "Found BLE adapter: \(peripheral.name ?? "Unknown")",
+        category: .connection
+    )
+
+    // Connect directly — no iOS pairing
+    try await elm327.connectToAdapter(
+        timeout: timeout,
+        peripheral: peripheral
+    )
+}
+
+	private var elm327CommAsBLEManager: BLEManager? {
+    switch connectionType {
+    case .bluetooth:
+        return elm327.value(forKey: "comm") as? BLEManager
+    default:
+        return nil
+    }
+}
 
     /// Initializes communication with the vehicle and retrieves vehicle information.
     ///
