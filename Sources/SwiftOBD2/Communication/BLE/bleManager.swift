@@ -68,7 +68,6 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     var connectionStatePublisher: Published<ConnectionState>.Publisher { $connectionState }
 
-
     public weak var obdDelegate: OBDServiceDelegate?
 
     // Focused components
@@ -79,7 +78,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     private var peripheralScanner: BLEPeripheralScanner!
 
     private var cancellables = Set<AnyCancellable>()
-    
+
     deinit {
         // Clean up resources
         cancellables.removeAll()
@@ -93,7 +92,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         super.init()
         // Use background queue for better performance, but dispatch UI updates to main queue
         let bleQueue = DispatchQueue(label: "com.swiftobd2.ble", qos: .userInitiated)
-        
+
         centralManager = CBCentralManager(
             delegate: self,
             queue: bleQueue,
@@ -109,16 +108,35 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         peripheralScanner = BLEPeripheralScanner()
     }
 
+    // MARK: - Public Async Helpers (added for OBDService auto-scan flow)
+
+    /// Starts scanning for peripherals (does not block).
+    /// This is used by OBDService to implement the “no iOS pairing needed” flow.
+    func scanForPeripherals(services: [CBUUID]?) async throws {
+        try await waitForPoweredOn()
+        startScanning(services)
+    }
+
+    /// Stops scanning if currently scanning.
+    func stopScanning() {
+        stopScan()
+    }
+
+    /// Awaits the first discovered peripheral (from the internal scanner), or throws on timeout.
+    func waitForFirstPeripheral(timeout: TimeInterval) async throws -> CBPeripheral {
+        try await peripheralScanner.waitForFirstPeripheral(timeout: timeout)
+    }
+
     // MARK: - Central Manager Control Methods
 
     func startScanning(_ serviceUUIDs: [CBUUID]?) {
-        guard centralManager.state == .poweredOn else { 
+        guard centralManager.state == .poweredOn else {
             obdWarning("Cannot start scanning - Bluetooth not powered on", category: .bluetooth)
-            return 
+            return
         }
-        
+
         obdDebug("Starting BLE scan for services: \(serviceUUIDs?.map { $0.uuidString } ?? ["All"])", category: .bluetooth)
-        
+
         // Use allowDuplicates: false for better performance - we don't need duplicate discovery events
         let scanOptions = [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         centralManager.scanForPeripherals(withServices: serviceUUIDs, options: scanOptions)
@@ -176,15 +194,15 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     func connect(to peripheral: CBPeripheral) {
         let peripheralName = peripheral.name ?? "Unnamed"
         obdInfo("Attempting connection to peripheral: \(peripheralName)", category: .bluetooth)
-        
+
         let oldState = connectionState
         connectionState = .connecting
         OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-        
+
         DispatchQueue.main.async {
             self.obdDelegate?.connectionStateChanged(state: .connecting)
         }
-        
+
         centralManager.connect(peripheral, options: [CBConnectPeripheralOptionNotifyOnDisconnectionKey: true])
         if centralManager.isScanning {
             centralManager.stopScan()
@@ -201,11 +219,11 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         let peripheralName = peripheral.name ?? "Unnamed"
         let errorMsg = error?.localizedDescription ?? "Unknown error"
         obdError("Connection failed to peripheral: \(peripheralName) - \(errorMsg)", category: .bluetooth)
-        
+
         let oldState = connectionState
         connectionState = .error
         OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-        
+
         DispatchQueue.main.async {
             self.obdDelegate?.connectionStateChanged(state: .error)
         }
@@ -225,7 +243,6 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let peripheral = peripherals.first {
             obdDebug("Restoring peripheral: \(peripherals[0].name ?? "Unnamed")", category: .bluetooth)
             peripheralManager.setPeripheral(peripheral)
-
         }
     }
 
@@ -260,26 +277,26 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         let oldState = connectionState
         connectionState = .connectedToAdapter
         OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-        
+
         // Dispatch delegate call to main queue since it might update UI
         DispatchQueue.main.async {
             self.obdDelegate?.connectionStateChanged(state: .connectedToAdapter)
         }
-        
+
         obdInfo("Characteristics setup complete, connected to adapter", category: .bluetooth)
     }
 
     func waitForPoweredOn() async throws {
         let maxWaitTime = BLEConstants.bluetoothPowerOnTimeout
         let startTime = CFAbsoluteTimeGetCurrent()
-        
+
         while centralManager.state != .poweredOn {
             // Check for timeout
             if CFAbsoluteTimeGetCurrent() - startTime > maxWaitTime {
                 obdError("Bluetooth failed to power on within \(maxWaitTime) seconds", category: .bluetooth)
                 throw BLEManagerError.timeout
             }
-            
+
             // Check for terminal states
             switch centralManager.state {
             case .unsupported:
@@ -293,24 +310,16 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
             default:
                 break
             }
-            
+
             try await Task.sleep(nanoseconds: BLEConstants.pollingInterval)
         }
-        
+
         obdDebug("Bluetooth powered on successfully", category: .bluetooth)
     }
-
 
     /// Sends a message to the connected peripheral and returns the response.
     /// - Parameter message: The message to send.
     /// - Returns: The response from the peripheral.
-    /// - Throws:
-    ///     `BLEManagerError.sendingMessagesInProgress` if a message is already being sent.
-    ///     `BLEManagerError.missingPeripheralOrCharacteristic` if the peripheral or ecu characteristic is missing.
-    ///     `BLEManagerError.incorrectDataConversion` if the data cannot be converted to ASCII.
-    ///     `BLEManagerError.peripheralNotConnected` if the peripheral is not connected.
-    ///     `BLEManagerError.timeout` if the operation times out.
-    ///     `BLEManagerError.unknownError` if an unknown error occurs.
     func sendCommand(_ command: String, retries _: Int = 3) async throws -> [String] {
         guard let peripheral = peripheralManager.connectedPeripheral else {
             obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
@@ -318,7 +327,7 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
 
         obdDebug("Sending command: \(command)", category: .communication)
-        
+
         do {
             try characteristicHandler.writeCommand(command, to: peripheral)
             let response = try await messageProcessor.waitForResponse(timeout: BLEConstants.defaultTimeout)
@@ -330,7 +339,6 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
         }
     }
 
-
     func scanForPeripherals() async throws {
         startScanning(nil)
         try await Task.sleep(nanoseconds: UInt64(BLEConstants.scanDuration * 1_000_000_000))
@@ -339,12 +347,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
 
     private func resetConfigure() {
         characteristicHandler.reset()
-        
+
         let oldState = connectionState
         connectionState = .disconnected
         if oldState != connectionState {
             OBDLogger.shared.logConnectionChange(from: oldState, to: connectionState)
-            
+
             DispatchQueue.main.async {
                 self.obdDelegate?.connectionStateChanged(state: .disconnected)
             }
