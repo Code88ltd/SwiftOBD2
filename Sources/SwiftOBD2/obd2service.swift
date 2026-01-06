@@ -55,6 +55,8 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     /// The internal ELM327 object responsible for direct adapter interaction.
     private var elm327: ELM327
+	private var bleManager: BLEManager?
+    private var wifiManager: WifiManager?
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -64,22 +66,27 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     ///
     ///
     public init(connectionType: ConnectionType = .bluetooth) {
-        self.connectionType = connectionType
+    self.connectionType = connectionType
+
 #if targetEnvironment(simulator)
-        elm327 = ELM327(comm: MOCKComm())
+    elm327 = ELM327(comm: MOCKComm())
 #else
-        switch connectionType {
-        case .bluetooth:
-            let bleManager = BLEManager()
-            elm327 = ELM327(comm: bleManager)
-        case .wifi:
-            elm327 = ELM327(comm: WifiManager())
-        case .demo:
-            elm327 = ELM327(comm: MOCKComm())
-        }
-#endif
-        elm327.obdDelegate = self
+    switch connectionType {
+    case .bluetooth:
+        let mgr = BLEManager()
+        self.bleManager = mgr
+        elm327 = ELM327(comm: mgr)
+    case .wifi:
+        let mgr = WifiManager()
+        self.wifiManager = mgr
+        elm327 = ELM327(comm: mgr)
+    case .demo:
+        elm327 = ELM327(comm: MOCKComm())
     }
+#endif
+
+    elm327.obdDelegate = self
+}
 
     // MARK: - Connection Handling
 
@@ -188,18 +195,25 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         initializeELM327()
     }
 
-    private func initializeELM327() {
-        switch connectionType {
-        case .bluetooth:
-            let bleManager = BLEManager()
-            elm327 = ELM327(comm: bleManager)
-        case .wifi:
-            elm327 = ELM327(comm: WifiManager())
-        case .demo:
-            elm327 = ELM327(comm: MOCKComm())
-        }
-        elm327.obdDelegate = self
+private func initializeELM327() {
+    switch connectionType {
+    case .bluetooth:
+        let mgr = BLEManager()
+        self.bleManager = mgr
+        self.wifiManager = nil
+        elm327 = ELM327(comm: mgr)
+    case .wifi:
+        let mgr = WifiManager()
+        self.wifiManager = mgr
+        self.bleManager = nil
+        elm327 = ELM327(comm: mgr)
+    case .demo:
+        self.bleManager = nil
+        self.wifiManager = nil
+        elm327 = ELM327(comm: MOCKComm())
     }
+    elm327.obdDelegate = self
+}
 
     // MARK: - Request Handling
 
