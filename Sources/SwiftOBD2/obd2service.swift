@@ -492,3 +492,87 @@ public struct VINInfo: Codable, Hashable {
     public let ModelYear: String
     public let EngineCylinders: String
 }
+
+import Combine
+import Foundation
+
+public struct LiveStreamResult: Equatable {
+    public let mode01: [OBDCommand: MeasurementResult]
+    public let mode22: [String: [UInt8]]   // key = "F442" etc (no "22" prefix)
+    public let mode21: [String: [UInt8]]   // key = "46" etc (no "21" prefix)
+
+    public init(
+        mode01: [OBDCommand: MeasurementResult],
+        mode22: [String: [UInt8]],
+        mode21: [String: [UInt8]]
+    ) {
+        self.mode01 = mode01
+        self.mode22 = mode22
+        self.mode21 = mode21
+    }
+}
+
+public extension OBDService {
+
+    /// Streams Mode 01 + Mode 22 + Mode 21 together on a timer.
+    /// - mode22PIDs: pass ["F442", ...] (no "22" prefix)
+    /// - mode21PIDs: pass ["46", ...]   (no "21" prefix)
+    func startContinuousLiveStream(
+        mode01: [OBDCommand],
+        mode22PIDs: [String],
+        mode21PIDs: [String],
+        unit: MeasurementUnit = .metric,
+        interval: TimeInterval = 0.3
+    ) -> AnyPublisher<LiveStreamResult, Error> {
+
+        Timer.publish(every: interval, on: .main, in: .common)
+            .autoconnect()
+            .flatMap { [weak self] _ -> Future<LiveStreamResult, Error> in
+                Future { promise in
+                    guard let self else {
+                        promise(.failure(OBDServiceError.notConnectedToVehicle))
+                        return
+                    }
+
+                    Task(priority: .userInitiated) {
+                        do {
+                            // Mode 01 (batched)
+                            let mode01Result: [OBDCommand: MeasurementResult]
+                            if mode01.isEmpty {
+                                mode01Result = [:]
+                            } else {
+                                mode01Result = try await self.requestPIDs(mode01, unit: unit)
+                            }
+
+                            // Mode 22 (one-by-one)
+                            let mode22Result: [String: [UInt8]]
+                            if mode22PIDs.isEmpty {
+                                mode22Result = [:]
+                            } else {
+                                mode22Result = try await self.requestMode22PIDs(mode22PIDs)
+                            }
+
+                            // Mode 21 (one-by-one)
+                            let mode21Result: [String: [UInt8]]
+                            if mode21PIDs.isEmpty {
+                                mode21Result = [:]
+                            } else {
+                                mode21Result = try await self.requestMode21PIDs(mode21PIDs)
+                            }
+
+                            promise(.success(
+                                LiveStreamResult(
+                                    mode01: mode01Result,
+                                    mode22: mode22Result,
+                                    mode21: mode21Result
+                                )
+                            ))
+                        } catch {
+                            promise(.failure(error))
+                        }
+                    }
+                }
+            }
+            .eraseToAnyPublisher()
+    }
+}
