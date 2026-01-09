@@ -59,7 +59,7 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     // MARK: Internal
-    private var elm327: ELM327
+    fileprivate var elm327: ELM327
     private var bleManager: BLEManager?
     private var wifiManager: WifiManager?
     private var cancellables = Set<AnyCancellable>()
@@ -120,10 +120,6 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
             case .bluetooth:
                 guard let bleManager else { throw OBDServiceError.noAdapterFound }
 
-                // connectAsync() already:
-                // - waits for central poweredOn
-                // - scans for supported services
-                // - connects and waits for characteristics
                 isScanning = true
                 defer { isScanning = false }
 
@@ -308,6 +304,140 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
             throw OBDServiceError.scanFailed(underlyingError: error)
         }
     }
+}
+
+// MARK: - NEW: Mode 22 / Mode 21 support
+
+public extension OBDService {
+
+    /// Generic raw PID request (e.g. "22F442", "2146").
+    /// Returns parsed payload bytes from the ECU response.
+    func requestRawPID(_ command: String, retries: Int = 10) async throws -> [UInt8] {
+        let cleaned = command
+            .replacingOccurrences(of: " ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+
+        let response = try await sendCommandInternal(cleaned, retries: retries)
+
+        guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
+            throw OBDServicePIDError.invalidResponse("No parsed response data")
+        }
+
+        // Support Data or [UInt8] depending on your protocol parser.
+        if let d = responseData as? Data {
+            return [UInt8](d)
+        }
+        if let arr = responseData as? [UInt8] {
+            return arr
+        }
+
+        throw OBDServicePIDError.invalidResponse("Unsupported response data type: \(type(of: responseData))")
+    }
+
+    /// Mode 22 request (extended diagnostics).
+    /// Example PID: "F442" -> sends "22F442" -> expects "62F442..."
+    func requestMode22(_ pid: String, retries: Int = 10) async throws -> [UInt8] {
+        let cleaned = pid.trimmed.uppercased()
+        guard cleaned.count == 4, let pidBytes = hexToBytes(cleaned), pidBytes.count == 2 else {
+            throw OBDServicePIDError.invalidRequest("Mode 22 PID must be 4 hex chars (2 bytes). Got: \(cleaned)")
+        }
+
+        let bytes = try await requestRawPID("22" + cleaned, retries: retries)
+
+        guard bytes.count >= 3 else {
+            throw OBDServicePIDError.invalidResponse("Mode 22 response too short")
+        }
+        guard bytes[0] == 0x62 else {
+            throw OBDServicePIDError.invalidResponse("Expected 0x62 response, got \(String(format: "0x%02X", bytes[0]))")
+        }
+        guard bytes[1] == pidBytes[0], bytes[2] == pidBytes[1] else {
+            throw OBDServicePIDError.invalidResponse("Mode 22 PID echo mismatch. Expected \(cleaned), got \(String(format: "%02X%02X", bytes[1], bytes[2]))")
+        }
+
+        // Data starts after 62 PIDHi PIDLo
+        return Array(bytes.dropFirst(3))
+    }
+
+    /// Batch Mode 22 requests (cannot be combined into one message like Mode 01).
+    func requestMode22PIDs(_ pids: [String], retries: Int = 10) async throws -> [String: [UInt8]] {
+        var results: [String: [UInt8]] = [:]
+        for pid in pids {
+            results[pid] = try await requestMode22(pid, retries: retries)
+        }
+        return results
+    }
+
+    /// Mode 21 request.
+    /// Example PID: "46" -> sends "2146" -> expects "6146..."
+    func requestMode21(_ pid: String, retries: Int = 10) async throws -> [UInt8] {
+        let cleaned = pid.trimmed.uppercased()
+        guard cleaned.count == 2, let pidBytes = hexToBytes(cleaned), pidBytes.count == 1 else {
+            throw OBDServicePIDError.invalidRequest("Mode 21 PID must be 2 hex chars (1 byte). Got: \(cleaned)")
+        }
+
+        let bytes = try await requestRawPID("21" + cleaned, retries: retries)
+
+        guard bytes.count >= 2 else {
+            throw OBDServicePIDError.invalidResponse("Mode 21 response too short")
+        }
+        guard bytes[0] == 0x61 else {
+            throw OBDServicePIDError.invalidResponse("Expected 0x61 response, got \(String(format: "0x%02X", bytes[0]))")
+        }
+        guard bytes[1] == pidBytes[0] else {
+            throw OBDServicePIDError.invalidResponse("Mode 21 PID echo mismatch. Expected \(cleaned), got \(String(format: "%02X", bytes[1]))")
+        }
+
+        // Data starts after 61 PID
+        return Array(bytes.dropFirst(2))
+    }
+
+    /// Batch Mode 21 requests.
+    func requestMode21PIDs(_ pids: [String], retries: Int = 10) async throws -> [String: [UInt8]] {
+        var results: [String: [UInt8]] = [:]
+        for pid in pids {
+            results[pid] = try await requestMode21(pid, retries: retries)
+        }
+        return results
+    }
+}
+
+// MARK: - NEW Errors for PID requests
+
+public enum OBDServicePIDError: Error, LocalizedError {
+    case invalidRequest(String)
+    case invalidResponse(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidRequest(let msg): return msg
+        case .invalidResponse(let msg): return msg
+        }
+    }
+}
+
+// MARK: - NEW Hex + String helpers
+
+private func hexToBytes(_ hex: String) -> [UInt8]? {
+    let s = hex.replacingOccurrences(of: " ", with: "").uppercased()
+    guard s.count % 2 == 0 else { return nil }
+
+    var out: [UInt8] = []
+    out.reserveCapacity(s.count / 2)
+
+    var idx = s.startIndex
+    while idx < s.endIndex {
+        let next = s.index(idx, offsetBy: 2)
+        let byteStr = String(s[idx..<next])
+        guard let b = UInt8(byteStr, radix: 16) else { return nil }
+        out.append(b)
+        idx = next
+    }
+    return out
+}
+
+private extension String {
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }
 
 // MARK: - Errors
