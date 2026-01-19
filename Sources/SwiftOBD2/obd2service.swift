@@ -35,6 +35,15 @@ public class ConfigurationService {
     }
 }
 
+// MARK: - ✅ Single request gate (prevents interleaved BLE responses)
+
+public actor OBDRequestLock {
+    public init() {}
+    public func withLock<T>(_ op: () async throws -> T) async throws -> T {
+        try await op()
+    }
+}
+
 /// A class that provides an interface to the ELM327 OBD2 adapter and the vehicle.
 ///
 /// - Key Responsibilities:
@@ -43,6 +52,7 @@ public class ConfigurationService {
 ///   - Providing information about the vehicle.
 ///   - Managing the connection state.
 public class OBDService: ObservableObject, OBDServiceDelegate {
+
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var isScanning: Bool = false
     @Published public private(set) var connectedPeripheral: CBPeripheral?
@@ -58,10 +68,13 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     private var cancellables = Set<AnyCancellable>()
 
+    /// ✅ One lock for ALL adapter/ECU I/O.
+    /// This is the #1 fix for: wrong PID readings, negative coolant after errors, “error 3” cascades on BLE ELM clones.
+    private let requestLock = OBDRequestLock()
+
     /// Initializes the OBDService object.
     ///
     /// - Parameter connectionType: The desired connection type (default is Bluetooth).
-    ///
     ///
     public init(connectionType: ConnectionType = .bluetooth) {
         self.connectionType = connectionType
@@ -101,14 +114,14 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
         let startTime = CFAbsoluteTimeGetCurrent()
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
-        
+
         do {
             obdDebug("Connecting to adapter...", category: .connection)
             try await elm327.connectToAdapter(timeout: timeout)
-            
+
             obdDebug("Initializing adapter...", category: .connection)
             try await elm327.adapterInitialization()
-            
+
             obdDebug("Initializing vehicle connection...", category: .connection)
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
 
@@ -121,15 +134,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
             obdError("Connection failed: \(error.localizedDescription)", category: .connection)
-            throw OBDServiceError.adapterConnectionFailed(underlyingError: error) // Propagate
+            throw OBDServiceError.adapterConnectionFailed(underlyingError: error)
         }
     }
 
     /// Initializes communication with the vehicle and retrieves vehicle information.
-    ///
-    /// - Parameter preferedProtocol: The optional OBD2 protocol to use (if supported).
-    /// - Returns: Information about the connected vehicle (`OBDInfo`).
-    /// - Throws: Errors if the vehicle initialization process fails.
     func initializeVehicle(_ preferedProtocol: PROTOCOL?) async throws -> OBDInfo {
         let obd2info = try await elm327.setupVehicle(preferredProtocol: preferedProtocol)
         return obd2info
@@ -141,8 +150,6 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// Switches the active connection type (between Bluetooth and Wi-Fi).
-    ///
-    /// - Parameter connectionType: The new desired connection type.
     private func switchConnectionType(_ connectionType: ConnectionType) {
         stopConnection()
         initializeELM327()
@@ -165,11 +172,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     var pidList: [OBDCommand] = []
 
-    /// Sends an OBD2 command to the vehicle and returns a publisher with the result.
-    /// - Parameter command: The OBD2 command to send.
-    /// - Returns: A publisher with the measurement result.
-    /// - Throws: Errors that might occur during the request process.
-    public func startContinuousUpdates(_ pids: [OBDCommand], unit: MeasurementUnit = .metric, interval: TimeInterval = 0.3) -> AnyPublisher<[OBDCommand: MeasurementResult], Error> {
+    public func startContinuousUpdates(
+        _ pids: [OBDCommand],
+        unit: MeasurementUnit = .metric,
+        interval: TimeInterval = 0.3
+    ) -> AnyPublisher<[OBDCommand: MeasurementResult], Error> {
         Timer.publish(every: interval, on: .main, in: .common)
             .autoconnect()
             .flatMap { [weak self] _ -> Future<[OBDCommand: MeasurementResult], Error> in
@@ -191,99 +198,118 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             .eraseToAnyPublisher()
     }
 
-    /// Adds an OBD2 command to the list of commands to be requested.
     public func addPID(_ pid: OBDCommand) {
         pidList.append(pid)
     }
 
-    /// Removes an OBD2 command from the list of commands to be requested.
     public func removePID(_ pid: OBDCommand) {
         pidList.removeAll { $0 == pid }
     }
 
-    /// Sends an OBD2 command to the vehicle and returns the raw response.
-    /// - Parameter command: The OBD2 command to send.
-    /// - Returns: measurement result
-    /// - Throws: Errors that might occur during the request process.
+    /// ✅ Batched Mode01 requests. Now serialized behind requestLock.
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
-        let response = try await sendCommandInternal("01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined(), retries: 10)
+        try await requestLock.withLock {
+            let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
+            let response = try await sendCommandInternal(message, retries: 10)
 
-        guard let responseData = try elm327.canProtocol?.parse(response).first?.data else { return [:] }
+            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else { return [:] }
 
-        var batchedResponse = BatchedResponse(response: responseData, unit)
+            var batchedResponse = BatchedResponse(response: responseData, unit)
 
-        let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
-            let measurement = batchedResponse.extractValue(command)
-            result[command] = measurement
-        }
-
-        return results
-    }
-
-    /// Sends an OBD2 command to the vehicle and returns the raw response.
-    ///  - Parameter command: The OBD2 command to send.
-    ///  - Returns: The raw response from the vehicle.
-    ///  - Throws: Errors that might occur during the request process.
-    public func sendCommand(_ command: OBDCommand) async throws -> Result<DecodeResult, DecodeError> {
-        do {
-            let response = try await sendCommandInternal(command.properties.command, retries: 3)
-            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                return .failure(.noData)
+            let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
+                let measurement = batchedResponse.extractValue(command)
+                result[command] = measurement
             }
-            return command.properties.decode(data: responseData.dropFirst())
-        } catch {
-            throw OBDServiceError.commandFailed(command: command.properties.command, error: error)
+
+            return results
         }
     }
 
-    /// Sends an OBD2 command to the vehicle and returns the raw response.
-    ///   - Parameter command: The OBD2 command to send.
-    ///   - Returns: The raw response from the vehicle.
+    /// ✅ Normal command request. Now serialized behind requestLock.
+    public func sendCommand(_ command: OBDCommand) async throws -> Result<DecodeResult, DecodeError> {
+        try await requestLock.withLock {
+            do {
+                let response = try await sendCommandInternal(command.properties.command, retries: 3)
+                guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
+                    return .failure(.noData)
+                }
+                return command.properties.decode(data: responseData.dropFirst())
+            } catch {
+                throw OBDServiceError.commandFailed(command: command.properties.command, error: error)
+            }
+        }
+    }
+
+    /// ✅ Supported PIDs. Recommended to serialize too.
     public func getSupportedPIDs() async -> [OBDCommand] {
-        await elm327.getSupportedPIDs()
+        (try? await requestLock.withLock {
+            await elm327.getSupportedPIDs()
+        }) ?? []
     }
 
-    ///  Scans for trouble codes and returns the result.
-    ///  - Returns: The trouble codes found on the vehicle.
-    ///  - Throws: Errors that might occur during the request process.
     public func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
-        do {
-            return try await elm327.scanForTroubleCodes()
-        } catch {
-            throw OBDServiceError.scanFailed(underlyingError: error)
+        try await requestLock.withLock {
+            do {
+                return try await elm327.scanForTroubleCodes()
+            } catch {
+                throw OBDServiceError.scanFailed(underlyingError: error)
+            }
         }
     }
 
-    /// Clears the trouble codes found on the vehicle.
-    ///  - Throws: Errors that might occur during the request process.
-    ///     - `OBDServiceError.notConnectedToVehicle` if the adapter is not connected to a vehicle.
     public func clearTroubleCodes() async throws {
-        do {
-            try await elm327.clearTroubleCodes()
-        } catch {
-            throw OBDServiceError.clearFailed(underlyingError: error)
+        try await requestLock.withLock {
+            do {
+                try await elm327.clearTroubleCodes()
+            } catch {
+                throw OBDServiceError.clearFailed(underlyingError: error)
+            }
         }
     }
 
-    /// Returns the vehicle's status.
-    ///  - Returns: The vehicle's status.
-    ///  - Throws: Errors that might occur during the request process.
     public func getStatus() async throws -> Result<DecodeResult, DecodeError> {
-        do {
-            return try await elm327.getStatus()
-        } catch {
-            throw error
+        try await requestLock.withLock {
+            try await elm327.getStatus()
         }
     }
 
-    //    public func switchToDemoMode(_ isDemoMode: Bool) {
-    //        elm327.switchToDemoMode(isDemoMode)
-    //    }
+    // MARK: - ✅ Vehicle Voltage (ATRV)
+
+    /// Reads battery/vehicle voltage from the adapter (ATRV).
+    /// Works as soon as you're connected to the adapter; vehicle connection helps but isn't strictly required.
+    public func requestVehicleVoltage(retries: Int = 2) async throws -> MeasurementResult {
+        try await requestLock.withLock {
+            guard connectionState != .disconnected else {
+                throw OBDServiceError.notConnectedToVehicle
+            }
+
+            let lines = try await sendCommandInternal("ATRV", retries: retries)
+
+            // Common: ["12.4V"] or ["12.4 V"] or includes prompt chars
+            let joined = lines.joined(separator: " ")
+            let cleaned = joined
+                .replacingOccurrences(of: ">", with: "")
+                .replacingOccurrences(of: "\0", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Remove "V" / "v"
+            let noV = cleaned.replacingOccurrences(of: "V", with: "", options: [.caseInsensitive])
+
+            // Grab first numeric token (handles weird extra text)
+            let token = noV
+                .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
+                .first(where: { !$0.isEmpty })
+
+            guard let token, let value = Double(token) else {
+                throw OBDServiceError.commandFailed(command: "ATRV", error: ELM327Error.invalidResponse(message: joined))
+            }
+
+            return MeasurementResult(value: value, unit: UnitElectricPotentialDifference.volts)
+        }
+    }
 
     /// Sends a raw command to the vehicle and returns the raw response.
-    /// - Parameter message: The raw command to send.
-    /// - Returns: The raw response from the vehicle.
-    /// - Throws: Errors that might occur during the request process.
+    /// NOTE: This is called inside requestLock wrappers above.
     public func sendCommandInternal(_ message: String, retries: Int) async throws -> [String] {
         do {
             return try await elm327.sendCommand(message, retries: retries)
@@ -306,63 +332,13 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             try await elm327.scanForPeripherals()
             self.isScanning = false
         } catch {
+            self.isScanning = false
             throw OBDServiceError.scanFailed(underlyingError: error)
         }
     }
-
-//    public func test() {
-//        if let resourcePath = Bundle.module.resourcePath {
-//               print("Bundle resources path: \(resourcePath)")
-//               let files = try? FileManager.default.contentsOfDirectory(atPath: resourcePath)
-//               print("Files in bundle: \(files ?? [])")
-//           }
-//        // Get the path for the JSON file within the app's bundle
-//        guard let path = Bundle.module.path(forResource: "commands", ofType: "json") else {
-//            print("Error: commands.json file not found in the bundle.")
-//            return
-//        }
-//
-//        // Load the file data
-//        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
-//            print("Error: Unable to load data from commands.json.")
-//            return
-//        }
-//
-//        do {
-//                // Load the JSON
-//                let data = try Data(contentsOf: URL(fileURLWithPath: path))
-//
-//                // Decode the JSON into an array of dictionaries to handle flexible structures
-//                guard var rawCommands = try JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] else {
-//                    print("Error: Invalid JSON format.")
-//                    return
-//                }
-//
-//                // Edit the `decoder` field
-//                rawCommands = rawCommands.map { command in
-//                    var updatedCommand = command
-//                    if let decoder = command["decoder"] as? [String: Any], let firstKey = decoder.keys.first {
-//                        updatedCommand["decoder"] = firstKey // Set the first key as the string value
-//                    } else {
-//                        updatedCommand["decoder"] = "none" // Default to "none" if no keys exist
-//                    }
-//                    return updatedCommand
-//                }
-//
-//                // Convert back to JSON data
-//                let updatedData = try JSONSerialization.data(withJSONObject: rawCommands, options: .prettyPrinted)
-//
-//                // Save the updated JSON to a file
-//                let outputPath = FileManager.default.temporaryDirectory.appendingPathComponent("commands_updated.json")
-//                try updatedData.write(to: outputPath)
-//
-//                print("Modified commands.json saved to: \(outputPath.path)")
-//            } catch {
-//                print("Error processing commands.json: \(error)")
-//            }
-//    }
-
 }
+
+// MARK: - Errors
 
 public enum OBDServiceError: Error {
     case noAdapterFound
@@ -373,21 +349,25 @@ public enum OBDServiceError: Error {
     case commandFailed(command: String, error: Error)
 }
 
+// MARK: - MeasurementResult
+
 public struct MeasurementResult: Equatable {
     public var value: Double
     public let unit: Unit
-	
-	public init(value: Double, unit: Unit) {
-		self.value = value
-		self.unit = unit
-	}
+
+    public init(value: Double, unit: Unit) {
+        self.value = value
+        self.unit = unit
+    }
 }
 
 public extension MeasurementResult {
-	static func mock(_ value: Double = 125, _ suffix: String = "km/h") -> MeasurementResult {
-		.init(value: value, unit: .init(symbol: suffix))
-	}
+    static func mock(_ value: Double = 125, _ suffix: String = "km/h") -> MeasurementResult {
+        .init(value: value, unit: .init(symbol: suffix))
+    }
 }
+
+// MARK: - VIN Helper (unchanged)
 
 public func getVINInfo(vin: String) async throws -> VINResults {
     let endpoint = "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/\(vin)?format=json"
