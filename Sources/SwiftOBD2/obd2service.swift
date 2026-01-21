@@ -271,47 +271,47 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         let response = try await sendCommandInternal(message, retries: 10)
 
         // Parse CAN frames
-        guard let frame = try elm327.canProtocol?.parse(response).first else {
-            let warn = "Batch parse produced no frames for [\(pidListString)]"
+      // Parse CAN frames
+guard let frame = try elm327.canProtocol?.parse(response).first else {
+    let warn = "Batch parse produced no frames for [\(pidListString)]"
+    obdWarning(warn, category: .communication)
+    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+    return [:]
+}
+
+guard let data = frame.data else {
+    let warn = "Parsed frame had nil data for [\(pidListString)] :: \(frame)"
+    obdWarning(warn, category: .communication)
+    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+    return [:]
+}
+
+// ✅ IMPORTANT: if only 1 PID was requested, decode as a normal PID response.
+if commands.count == 1, let cmd = commands.first {
+    // Typical: [41, PID, A, B, ...]
+    let decoded = cmd.properties.decode(data: data.dropFirst())
+
+    switch decoded {
+    case .success(let val):
+        if let m = val as? MeasurementResult {
+            return [cmd: m]
+        } else {
+            let warn = "Single PID decoded but not MeasurementResult for \(cmd.properties.command)"
             obdWarning(warn, category: .communication)
             postOBDLogEvent(level: "warning", category: .communication, message: warn)
             return [:]
         }
 
-        let data = frame.data
+    case .failure(let err):
+        let warn = "Single PID decode failed for \(cmd.properties.command): \(err)"
+        obdWarning(warn, category: .communication)
+        postOBDLogEvent(level: "warning", category: .communication, message: warn)
+        return [:]
+    }
+}
 
-        // ✅ IMPORTANT: if only 1 PID was requested, decode as a normal PID response.
-        if commands.count == 1, let cmd = commands.first {
-            // Typical: [41, PID, A, B, ...]
-            // Your existing decode expects data.dropFirst() in sendCommand() so we mirror that.
-            let decoded = cmd.properties.decode(data: data.dropFirst())
-
-            switch decoded {
-            case .success(let val):
-                // Convert DecodeResult -> MeasurementResult if needed by your app;
-                // If your BatchedResponse was doing this conversion, keep that logic there.
-                // For now we try to extract MeasurementResult from DecodeResult if it's already that type.
-                if let m = val as? MeasurementResult {
-                    return [cmd: m]
-                } else {
-                    // If DecodeResult isn't MeasurementResult in your codebase, keep using BatchedResponse
-                    // as a converter, but don’t use extractValue. Instead, let your app handle it.
-                    let warn = "Single PID decoded but not MeasurementResult for \(cmd.properties.command)"
-                    obdWarning(warn, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
-                    return [:]
-                }
-
-            case .failure(let err):
-                let warn = "Single PID decode failed for \(cmd.properties.command): \(err)"
-                obdWarning(warn, category: .communication)
-                postOBDLogEvent(level: "warning", category: .communication, message: warn)
-                return [:]
-            }
-        }
-
-        // ✅ Multi-PID path (keep your existing BatchedResponse behavior)
-        var batchedResponse = BatchedResponse(response: data, unit)
+// Multi-PID path (keep existing BatchedResponse behavior)
+var batchedResponse = BatchedResponse(response: data, unit)
 
         let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
             let measurement = batchedResponse.extractValue(command)
