@@ -12,8 +12,29 @@ public protocol OBDServiceDelegate: AnyObject {
     func connectionStateChanged(state: ConnectionState)
 }
 
+// MARK: - ✅ App log bridge event name (module -> app)
+
 public extension Notification.Name {
     static let obdLogEvent = Notification.Name("obdLogEvent")
+}
+
+// MARK: - ✅ NotificationCenter log bridge helper
+// Posts logs from SwiftOBD2 module so the host app can forward them into LogStore.shared.
+
+private func postOBDLogEvent(level: String, category: OBDLogger.Category, message: String) {
+    let payload: [String: Any] = [
+        "level": level,
+        "category": category.rawValue,
+        "message": message
+    ]
+
+    if Thread.isMainThread {
+        NotificationCenter.default.post(name: .obdLogEvent, object: nil, userInfo: payload)
+    } else {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .obdLogEvent, object: nil, userInfo: payload)
+        }
+    }
 }
 
 struct Command: Codable {
@@ -139,26 +160,32 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
         let startTime = CFAbsoluteTimeGetCurrent()
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
+        postOBDLogEvent(level: "info", category: .connection, message: "Starting connection with timeout: \(timeout)s")
 
         do {
             obdDebug("Connecting to adapter...", category: .connection)
+            postOBDLogEvent(level: "debug", category: .connection, message: "Connecting to adapter...")
             try await elm327.connectToAdapter(timeout: timeout)
 
             obdDebug("Initializing adapter...", category: .connection)
+            postOBDLogEvent(level: "debug", category: .connection, message: "Initializing adapter...")
             try await elm327.adapterInitialization()
 
             obdDebug("Initializing vehicle connection...", category: .connection)
+            postOBDLogEvent(level: "debug", category: .connection, message: "Initializing vehicle connection...")
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
 
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
             obdInfo("Successfully connected to vehicle: \(vehicleInfo.vin ?? "Unknown")", category: .connection)
+            postOBDLogEvent(level: "info", category: .connection, message: "Successfully connected to vehicle: \(vehicleInfo.vin ?? "Unknown")")
 
             return vehicleInfo
         } catch {
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             OBDLogger.shared.logPerformance("Connection failed", duration: duration, success: false)
             obdError("Connection failed: \(error.localizedDescription)", category: .connection)
+            postOBDLogEvent(level: "error", category: .connection, message: "Connection failed: \(error.localizedDescription)")
             throw OBDServiceError.adapterConnectionFailed(underlyingError: error)
         }
     }
@@ -235,13 +262,17 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
         try await requestLock.withLock {
             let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
-            obdDebug("Batch request: [\(pidListString)]", category: .communication)
+            let batchMsg = "Batch request: [\(pidListString)]"
+            obdDebug(batchMsg, category: .communication)
+            postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
 
             let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
             let response = try await sendCommandInternal(message, retries: 10)
 
             guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                obdWarning("Batch parse produced no frames for [\(pidListString)]", category: .communication)
+                let warn = "Batch parse produced no frames for [\(pidListString)]"
+                obdWarning(warn, category: .communication)
+                postOBDLogEvent(level: "warning", category: .communication, message: warn)
                 return [:]
             }
 
@@ -252,7 +283,9 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 if let measurement {
                     result[command] = measurement
                 } else {
-                    obdWarning("NO DATA in batch for PID \(command.properties.command)", category: .communication)
+                    let warn = "NO DATA in batch for PID \(command.properties.command)"
+                    obdWarning(warn, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
                 }
             }
 
@@ -266,13 +299,17 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             do {
                 let response = try await sendCommandInternal(command.properties.command, retries: 3)
                 guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                    obdWarning("Parse NO DATA for \(command.properties.command)", category: .communication)
+                    let warn = "Parse NO DATA for \(command.properties.command)"
+                    obdWarning(warn, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
                     return .failure(.noData)
                 }
 
                 let decoded = command.properties.decode(data: responseData.dropFirst())
                 if case .failure(let err) = decoded {
-                    obdWarning("Decode failed for \(command.properties.command): \(err)", category: .communication)
+                    let warn = "Decode failed for \(command.properties.command): \(err)"
+                    obdWarning(warn, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
                 }
                 return decoded
             } catch {
@@ -355,7 +392,9 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         let id = nextRequestID()
         let start = CFAbsoluteTimeGetCurrent()
 
-        obdDebug("TX [#\(id)] → \(message) (retries=\(retries))", category: .communication)
+        let tx = "TX [#\(id)] → \(message) (retries=\(retries))"
+        obdDebug(tx, category: .communication)
+        postOBDLogEvent(level: "debug", category: .communication, message: tx)
 
         do {
             let lines = try await elm327.sendCommand(message, retries: retries)
@@ -363,15 +402,21 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             let formatted = formatLines(lines)
 
             if isLikelyNoData(lines) {
-                obdWarning("RX [#\(id)] ← NO DATA (\(ms)ms) :: \(formatted)", category: .communication)
+                let msg = "RX [#\(id)] ← NO DATA (\(ms)ms) :: \(formatted)"
+                obdWarning(msg, category: .communication)
+                postOBDLogEvent(level: "warning", category: .communication, message: msg)
             } else {
-                obdDebug("RX [#\(id)] ← (\(ms)ms) :: \(formatted)", category: .communication)
+                let msg = "RX [#\(id)] ← (\(ms)ms) :: \(formatted)"
+                obdDebug(msg, category: .communication)
+                postOBDLogEvent(level: "debug", category: .communication, message: msg)
             }
 
             return lines
         } catch {
             let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
-            obdError("ERR [#\(id)] \(message) (\(ms)ms) :: \(error.localizedDescription)", category: .communication)
+            let msg = "ERR [#\(id)] \(message) (\(ms)ms) :: \(error.localizedDescription)"
+            obdError(msg, category: .communication)
+            postOBDLogEvent(level: "error", category: .communication, message: msg)
             throw OBDServiceError.commandFailed(command: message, error: error)
         }
     }
