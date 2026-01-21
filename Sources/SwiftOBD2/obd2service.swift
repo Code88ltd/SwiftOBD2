@@ -12,6 +12,10 @@ public protocol OBDServiceDelegate: AnyObject {
     func connectionStateChanged(state: ConnectionState)
 }
 
+public extension Notification.Name {
+    static let obdLogEvent = Notification.Name("obdLogEvent")
+}
+
 struct Command: Codable {
     var bytes: Int
     var command: String
