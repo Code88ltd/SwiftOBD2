@@ -36,6 +36,10 @@ public class ConfigurationService {
 }
 
 // MARK: - ✅ Single request gate (prevents interleaved BLE responses)
+/// Terminates the connection with the OBD2 adapter.
+public func stopConnection() {
+    elm327.stopConnection()
+}
 
 public actor OBDRequestLock {
     public init() {}
