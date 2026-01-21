@@ -259,39 +259,74 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// ✅ Batched Mode01 requests. Now serialized behind requestLock.
-    public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
-        try await requestLock.withLock {
-            let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
-            let batchMsg = "Batch request: [\(pidListString)]"
-            obdDebug(batchMsg, category: .communication)
-            postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
+   public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
+    try await requestLock.withLock {
+        let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
+        let batchMsg = "Batch request: [\(pidListString)]"
+        obdDebug(batchMsg, category: .communication)
+        postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
 
-            let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
-            let response = try await sendCommandInternal(message, retries: 10)
+        // Build the request
+        let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
+        let response = try await sendCommandInternal(message, retries: 10)
 
-            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                let warn = "Batch parse produced no frames for [\(pidListString)]"
+        // Parse CAN frames
+        guard let frame = try elm327.canProtocol?.parse(response).first else {
+            let warn = "Batch parse produced no frames for [\(pidListString)]"
+            obdWarning(warn, category: .communication)
+            postOBDLogEvent(level: "warning", category: .communication, message: warn)
+            return [:]
+        }
+
+        let data = frame.data
+
+        // ✅ IMPORTANT: if only 1 PID was requested, decode as a normal PID response.
+        if commands.count == 1, let cmd = commands.first {
+            // Typical: [41, PID, A, B, ...]
+            // Your existing decode expects data.dropFirst() in sendCommand() so we mirror that.
+            let decoded = cmd.properties.decode(data: data.dropFirst())
+
+            switch decoded {
+            case .success(let val):
+                // Convert DecodeResult -> MeasurementResult if needed by your app;
+                // If your BatchedResponse was doing this conversion, keep that logic there.
+                // For now we try to extract MeasurementResult from DecodeResult if it's already that type.
+                if let m = val as? MeasurementResult {
+                    return [cmd: m]
+                } else {
+                    // If DecodeResult isn't MeasurementResult in your codebase, keep using BatchedResponse
+                    // as a converter, but don’t use extractValue. Instead, let your app handle it.
+                    let warn = "Single PID decoded but not MeasurementResult for \(cmd.properties.command)"
+                    obdWarning(warn, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                    return [:]
+                }
+
+            case .failure(let err):
+                let warn = "Single PID decode failed for \(cmd.properties.command): \(err)"
                 obdWarning(warn, category: .communication)
                 postOBDLogEvent(level: "warning", category: .communication, message: warn)
                 return [:]
             }
-
-            var batchedResponse = BatchedResponse(response: responseData, unit)
-
-            let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
-                let measurement = batchedResponse.extractValue(command)
-                if let measurement {
-                    result[command] = measurement
-                } else {
-                    let warn = "NO DATA in batch for PID \(command.properties.command)"
-                    obdWarning(warn, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
-                }
-            }
-
-            return results
         }
+
+        // ✅ Multi-PID path (keep your existing BatchedResponse behavior)
+        var batchedResponse = BatchedResponse(response: data, unit)
+
+        let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
+            let measurement = batchedResponse.extractValue(command)
+            if let measurement {
+                result[command] = measurement
+            } else {
+                let warn = "NO DATA in batch for PID \(command.properties.command)"
+                obdWarning(warn, category: .communication)
+                postOBDLogEvent(level: "warning", category: .communication, message: warn)
+            }
+        }
+
+        return results
     }
+}
 
     /// ✅ Normal command request. Now serialized behind requestLock.
     public func sendCommand(_ command: OBDCommand) async throws -> Result<DecodeResult, DecodeError> {
