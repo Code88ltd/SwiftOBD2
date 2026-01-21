@@ -8,9 +8,7 @@ public enum ConnectionType: String, CaseIterable {
     case demo = "Demo"
 }
 
-public protocol OBDServiceDelegate: AnyObject {
-    func connectionStateChanged(state: ConnectionState)
-}
+
 
 struct Command: Codable {
     var bytes: Int
@@ -115,6 +113,10 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         }
     }
 
+    /// Terminates the connection with the OBD2 adapter.
+public func stopConnection() {
+    elm327.stopConnection()
+}
     // MARK: - Request Handling
 
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
