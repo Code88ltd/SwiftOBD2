@@ -34,7 +34,9 @@ public class ConfigurationService {
 }
 
 // MARK: - ✅ Single request gate (prevents interleaved BLE responses)
-
+public protocol OBDServiceDelegate: AnyObject {
+    func connectionStateChanged(state: ConnectionState)
+}
 
 public actor OBDRequestLock {
     public init() {}
