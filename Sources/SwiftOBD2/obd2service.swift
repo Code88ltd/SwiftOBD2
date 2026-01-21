@@ -72,6 +72,27 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// This is the #1 fix for: wrong PID readings, negative coolant after errors, “error 3” cascades on BLE ELM clones.
     private let requestLock = OBDRequestLock()
 
+    // MARK: - Logging helpers
+
+    private var requestCounter: UInt64 = 0
+    private func nextRequestID() -> UInt64 {
+        requestCounter &+= 1
+        return requestCounter
+    }
+
+    private func formatLines(_ lines: [String]) -> String {
+        lines
+            .map { $0.replacingOccurrences(of: "\0", with: "") }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+    }
+
+    private func isLikelyNoData(_ lines: [String]) -> Bool {
+        let joined = lines.joined(separator: " ").uppercased()
+        return joined.contains("NO DATA") || joined.contains("NODATA") || joined == "?"
+    }
+
     /// Initializes the OBDService object.
     ///
     /// - Parameter connectionType: The desired connection type (default is Bluetooth).
@@ -209,16 +230,26 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// ✅ Batched Mode01 requests. Now serialized behind requestLock.
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
         try await requestLock.withLock {
+            let pidList = commands.map { $0.properties.command }.joined(separator: ", ")
+            obdDebug("Batch request: [\(pidList)]", category: .obd)
+
             let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
             let response = try await sendCommandInternal(message, retries: 10)
 
-            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else { return [:] }
+            guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
+                obdWarning("Batch parse produced no frames for [\(pidList)]", category: .obd)
+                return [:]
+            }
 
             var batchedResponse = BatchedResponse(response: responseData, unit)
 
             let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
                 let measurement = batchedResponse.extractValue(command)
-                result[command] = measurement
+                if let measurement {
+                    result[command] = measurement
+                } else {
+                    obdWarning("NO DATA in batch for PID \(command.properties.command)", category: .obd)
+                }
             }
 
             return results
@@ -231,10 +262,17 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             do {
                 let response = try await sendCommandInternal(command.properties.command, retries: 3)
                 guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
+                    obdWarning("Parse NO DATA for \(command.properties.command)", category: .obd)
                     return .failure(.noData)
                 }
-                return command.properties.decode(data: responseData.dropFirst())
+
+                let decoded = command.properties.decode(data: responseData.dropFirst())
+                if case .failure(let err) = decoded {
+                    obdWarning("Decode failed for \(command.properties.command): \(err)", category: .obd)
+                }
+                return decoded
             } catch {
+                obdError("Command failed \(command.properties.command): \(error.localizedDescription)", category: .obd)
                 throw OBDServiceError.commandFailed(command: command.properties.command, error: error)
             }
         }
@@ -311,9 +349,27 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// Sends a raw command to the vehicle and returns the raw response.
     /// NOTE: This is called inside requestLock wrappers above.
     public func sendCommandInternal(_ message: String, retries: Int) async throws -> [String] {
+        let id = nextRequestID()
+        let start = CFAbsoluteTimeGetCurrent()
+
+        obdDebug("TX [#\(id)] → \(message) (retries=\(retries))", category: .obd)
+
         do {
-            return try await elm327.sendCommand(message, retries: retries)
+            let lines = try await elm327.sendCommand(message, retries: retries)
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+
+            let formatted = formatLines(lines)
+
+            if isLikelyNoData(lines) {
+                obdWarning("RX [#\(id)] ← NO DATA (\(ms)ms) :: \(formatted)", category: .obd)
+            } else {
+                obdDebug("RX [#\(id)] ← (\(ms)ms) :: \(formatted)", category: .obd)
+            }
+
+            return lines
         } catch {
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            obdError("ERR [#\(id)] \(message) (\(ms)ms) :: \(error.localizedDescription)", category: .obd)
             throw OBDServiceError.commandFailed(command: message, error: error)
         }
     }
