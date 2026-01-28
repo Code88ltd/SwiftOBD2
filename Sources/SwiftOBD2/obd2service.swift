@@ -424,8 +424,25 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             }
 
             return lines
-        } catch {
+                } catch {
             let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+
+            // "NO DATA" is a normal outcome for unsupported PIDs (many ECUs advertise a PID map
+            // that differs from what individual sub-modules respond to).
+            // The BLE stack reports this as BLEManagerError.noData (error 5). Don't fail the whole
+            // command; instead return an empty response so callers can treat the value as missing.
+            if let ble = error as? BLEManagerError {
+                switch ble {
+                case .noData:
+                    let msg = "ERR [#\(id)] \(message) (\(ms)ms) :: NO DATA"
+                    obdWarning(msg, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: msg)
+                    return []
+                default:
+                    break
+                }
+            }
+
             let msg = "ERR [#\(id)] \(message) (\(ms)ms) :: \(error.localizedDescription)"
             obdError(msg, category: .communication)
             postOBDLogEvent(level: "error", category: .communication, message: msg)
