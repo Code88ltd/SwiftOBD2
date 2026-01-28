@@ -213,6 +213,25 @@ extension OBDCommand {
                     return "20 90 07 E0 11 00"
                 case .pidsC:
                     return "40 FA DC 80 00 00"
+                 case .pidsD:
+    // 0160 supports 61–80. You have 61–7F plus 80 (pidsE) defined => all bits on.
+    return "60 FF FF FF FF 00"
+
+case .pidsE:
+    // 0180 supports 81–A0.
+    // You have 81–94, 98–9F and A0 (pidsF). Missing 95–97 => byte3 becomes F1.
+    return "80 FF FF F1 FF 00"
+
+case .pidsF:
+    // 01A0 supports A1–C0.
+    // You have A1–A8, A9, and C0 (pidsG). Everything else in between missing.
+    // => FF 80 00 01
+    return "A0 FF 80 00 01 00"
+
+case .pidsG:
+    // 01C0 supports C1–E0.
+    // You have C3–C8 only. (C1,C2 missing) => first byte = 3F, rest 00.
+    return "C0 3F 00 00 00 00"
                 case .rpm:
                     let desiredRPM = Int.random(in: 1000...3000)
                     let decimalRep = desiredRPM * 4
