@@ -336,6 +336,32 @@ case fuelPressureAB               // 01C5
 case particulateControlStatus     // 01C6
 case distanceSinceReflash         // 01C7
 case noxParticulateWarningLamp    // 01C8
+case turboInletPressure
+case turboTemp1
+case turboTemp2
+case dpfDiffPressure
+case dpfStatus
+case noxNTEStatus
+case pmNTEStatus
+case engineRunTimeTotal
+case pmSensor
+case intakeManifoldPressure2
+case o2WideRange
+case pmSensorBank12
+case wwhOBDInfo1
+case wwhOBDInfo2
+case wwhOBDCounters
+case noxWarningSystem
+case hybridBatteryData
+case defSensorData
+case fuelSystemPercentUse
+case noxSensorCorrected
+case evapSystemPressureAlt2
+case noxSensorConc34
+case noxSensorCorrectedConc34
+case absDisableSwitch
+case exhaustParticulateDiag
+case noxPMWarningLamp
 		
     }
 
