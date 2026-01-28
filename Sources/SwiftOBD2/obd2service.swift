@@ -61,11 +61,21 @@ public class ConfigurationService {
 }
 
 // MARK: - ✅ Single request gate (prevents interleaved BLE responses)
+//
+// Important: a plain actor method is NOT a lock if it awaits.
+// This implementation blocks other callers until the current op completes.
 
 public actor OBDRequestLock {
+    private var isLocked = false
     public init() {}
+
     public func withLock<T>(_ op: () async throws -> T) async throws -> T {
-        try await op()
+        while isLocked {
+            try await Task.sleep(nanoseconds: 5_000_000) // 5ms
+        }
+        isLocked = true
+        defer { isLocked = false }
+        return try await op()
     }
 }
 
@@ -94,7 +104,6 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     private var cancellables = Set<AnyCancellable>()
 
     /// ✅ One lock for ALL adapter/ECU I/O.
-    /// This is the #1 fix for: wrong PID readings, negative coolant after errors, “error 3” cascades on BLE ELM clones.
     private let requestLock = OBDRequestLock()
 
     // MARK: - ✅ Logging helpers (TX/RX)
@@ -119,9 +128,6 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// Initializes the OBDService object.
-    ///
-    /// - Parameter connectionType: The desired connection type (default is Bluetooth).
-    ///
     public init(connectionType: ConnectionType = .bluetooth) {
         self.connectionType = connectionType
 #if targetEnvironment(simulator)
@@ -153,10 +159,6 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// Initiates the connection process to the OBD2 adapter and vehicle.
-    ///
-    /// - Parameter preferedProtocol: The optional OBD2 protocol to use (if supported).
-    /// - Returns: Information about the connected vehicle (`OBDInfo`).
-    /// - Throws: Errors that might occur during the connection process.
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
         let startTime = CFAbsoluteTimeGetCurrent()
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
@@ -192,8 +194,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     /// Initializes communication with the vehicle and retrieves vehicle information.
     func initializeVehicle(_ preferedProtocol: PROTOCOL?) async throws -> OBDInfo {
-        let obd2info = try await elm327.setupVehicle(preferredProtocol: preferedProtocol)
-        return obd2info
+        try await elm327.setupVehicle(preferredProtocol: preferedProtocol)
     }
 
     /// Terminates the connection with the OBD2 adapter.
@@ -229,9 +230,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         unit: MeasurementUnit = .metric,
         interval: TimeInterval = 0.3
     ) -> AnyPublisher<[OBDCommand: MeasurementResult], Error> {
-        Timer.publish(every: interval, on: .main, in: .common)
+
+        // ✅ Important: prevent timer pile-ups. Only allow 1 in-flight request.
+        return Timer.publish(every: interval, on: .main, in: .common)
             .autoconnect()
-            .flatMap { [weak self] _ -> Future<[OBDCommand: MeasurementResult], Error> in
+            .flatMap(maxPublishers: .max(1)) { [weak self] _ -> AnyPublisher<[OBDCommand: MeasurementResult], Error> in
                 Future { promise in
                     guard let self = self else {
                         promise(.failure(OBDServiceError.notConnectedToVehicle))
@@ -246,6 +249,7 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                         }
                     }
                 }
+                .eraseToAnyPublisher()
             }
             .eraseToAnyPublisher()
     }
@@ -258,77 +262,54 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         pidList.removeAll { $0 == pid }
     }
 
-    /// ✅ Batched Mode01 requests. Now serialized behind requestLock.
-   public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
-    try await requestLock.withLock {
-        let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
-        let batchMsg = "Batch request: [\(pidListString)]"
-        obdDebug(batchMsg, category: .communication)
-        postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
+    /// ✅ Batched Mode01 requests. Serialized behind requestLock.
+    ///
+    /// IMPORTANT CHANGE:
+    /// - Removed the "single PID special-case decode" because it often slices the wrong bytes.
+    /// - Always decode using BatchedResponse (same behavior as your original working file).
+    public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
+        try await requestLock.withLock {
 
-        // Build the request
-        let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
-        let response = try await sendCommandInternal(message, retries: 10)
+            let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
+            let batchMsg = "Batch request: [\(pidListString)]"
+            obdDebug(batchMsg, category: .communication)
+            postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
 
-        // Parse CAN frames
-      // Parse CAN frames
-guard let frame = try elm327.canProtocol?.parse(response).first else {
-    let warn = "Batch parse produced no frames for [\(pidListString)]"
-    obdWarning(warn, category: .communication)
-    postOBDLogEvent(level: "warning", category: .communication, message: warn)
-    return [:]
-}
+            // Build Mode01 multi-PID request: 01 + PID bytes without "01"
+            let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
+            let response = try await sendCommandInternal(message, retries: 10)
 
-guard let data = frame.data else {
-    let warn = "Parsed frame had nil data for [\(pidListString)] :: \(frame)"
-    obdWarning(warn, category: .communication)
-    postOBDLogEvent(level: "warning", category: .communication, message: warn)
-    return [:]
-}
-
-// ✅ IMPORTANT: if only 1 PID was requested, decode as a normal PID response.
-if commands.count == 1, let cmd = commands.first {
-    // Typical: [41, PID, A, B, ...]
-    let decoded = cmd.properties.decode(data: data.dropFirst())
-
-    switch decoded {
-    case .success(let val):
-        if let m = val as? MeasurementResult {
-            return [cmd: m]
-        } else {
-            let warn = "Single PID decoded but not MeasurementResult for \(cmd.properties.command)"
-            obdWarning(warn, category: .communication)
-            postOBDLogEvent(level: "warning", category: .communication, message: warn)
-            return [:]
-        }
-
-    case .failure(let err):
-        let warn = "Single PID decode failed for \(cmd.properties.command): \(err)"
-        obdWarning(warn, category: .communication)
-        postOBDLogEvent(level: "warning", category: .communication, message: warn)
-        return [:]
-    }
-}
-
-// Multi-PID path (keep existing BatchedResponse behavior)
-var batchedResponse = BatchedResponse(response: data, unit)
-
-        let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
-            let measurement = batchedResponse.extractValue(command)
-            if let measurement {
-                result[command] = measurement
-            } else {
-                let warn = "NO DATA in batch for PID \(command.properties.command)"
+            guard let frame = try elm327.canProtocol?.parse(response).first else {
+                let warn = "Batch parse produced no frames for [\(pidListString)]"
                 obdWarning(warn, category: .communication)
                 postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                return [:]
             }
+
+            guard let data = frame.data else {
+                let warn = "Parsed frame had nil data for [\(pidListString)] :: \(frame)"
+                obdWarning(warn, category: .communication)
+                postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                return [:]
+            }
+
+            var batchedResponse = BatchedResponse(response: data, unit)
+
+            let results: [OBDCommand: MeasurementResult] = commands.reduce(into: [:]) { result, command in
+                if let measurement = batchedResponse.extractValue(command) {
+                    result[command] = measurement
+                } else {
+                    let warn = "NO DATA / decode miss in batch for PID \(command.properties.command)"
+                    obdWarning(warn, category: .communication)
+                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                }
+            }
+
+            return results
         }
-
-        return results
     }
-}
 
-    /// ✅ Normal command request. Now serialized behind requestLock.
+    /// ✅ Normal command request. Serialized behind requestLock.
     public func sendCommand(_ command: OBDCommand) async throws -> Result<DecodeResult, DecodeError> {
         try await requestLock.withLock {
             do {
@@ -353,7 +334,7 @@ var batchedResponse = BatchedResponse(response: data, unit)
         }
     }
 
-    /// ✅ Supported PIDs. Recommended to serialize too.
+    /// ✅ Supported PIDs. Serialized too.
     public func getSupportedPIDs() async -> [OBDCommand] {
         (try? await requestLock.withLock {
             await elm327.getSupportedPIDs()
@@ -389,7 +370,6 @@ var batchedResponse = BatchedResponse(response: data, unit)
     // MARK: - ✅ Vehicle Voltage (ATRV)
 
     /// Reads battery/vehicle voltage from the adapter (ATRV).
-    /// Works as soon as you're connected to the adapter; vehicle connection helps but isn't strictly required.
     public func requestVehicleVoltage(retries: Int = 2) async throws -> MeasurementResult {
         try await requestLock.withLock {
             guard connectionState != .disconnected else {
@@ -398,17 +378,14 @@ var batchedResponse = BatchedResponse(response: data, unit)
 
             let lines = try await sendCommandInternal("ATRV", retries: retries)
 
-            // Common: ["12.4V"] or ["12.4 V"] or includes prompt chars
             let joined = lines.joined(separator: " ")
             let cleaned = joined
                 .replacingOccurrences(of: ">", with: "")
                 .replacingOccurrences(of: "\0", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            // Remove "V" / "v"
             let noV = cleaned.replacingOccurrences(of: "V", with: "", options: [.caseInsensitive])
 
-            // Grab first numeric token (handles weird extra text)
             let token = noV
                 .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
                 .first(where: { !$0.isEmpty })
