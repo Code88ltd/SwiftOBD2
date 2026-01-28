@@ -8,11 +8,6 @@
 import Foundation
 
 public extension DecodeResult {
-//    var stringResult: String? {
-//        if case let .stringResult(res) = self { return res as String }
-//        return nil
-//    }
-
     var statusResult: Status? {
         if case let .statusResult(res) = self { return res as Status }
         return nil
@@ -43,13 +38,15 @@ public struct CommandProperties: Encodable {
     public let maxValue: Double
     public let minValue: Double
 
-    public init(_ command: String,
-                _ description: String,
-                _ bytes: Int,
-                _ decoder: Decoders,
-                _ live: Bool = false,
-                maxValue: Double = 100,
-                minValue: Double = 0) {
+    public init(
+        _ command: String,
+        _ description: String,
+        _ bytes: Int,
+        _ decoder: Decoders,
+        _ live: Bool = false,
+        maxValue: Double = 100,
+        minValue: Double = 0
+    ) {
         self.command = command
         self.description = description
         self.bytes = bytes
@@ -58,10 +55,6 @@ public struct CommandProperties: Encodable {
         self.maxValue = maxValue
         self.minValue = minValue
     }
-
-//    public func decode(data: Data, unit: MeasurementUnit = .metric) -> Result<DecodeResult, DecodeError> {
-//        return decoder.performDecode(data: data.dropFirst(), unit: unit)
-//    }
 
     func decode(data: Data, unit: MeasurementUnit = .metric) -> Result<DecodeResult, DecodeError> {
         guard let decoderInstance = decoder.getDecoder() else {
@@ -75,26 +68,22 @@ public enum OBDCommand: Codable, Hashable, Comparable, Identifiable {
     case general(General)
     case mode1(Mode1)
     case mode3(Mode3)
+    case mode4(Mode4)              // ✅ added
     case mode6(Mode6)
     case mode9(Mode9)
     case protocols(Protocols)
-	
-	public var id: Self { return self }
+
+    public var id: Self { self }
 
     public var properties: CommandProperties {
         switch self {
-        case let .general(command):
-            return command.properties
-        case let .mode1(command):
-            return command.properties
-        case let .mode9(command):
-            return command.properties
-        case let .mode6(command):
-            return command.properties
-        case let .mode3(command):
-            return command.properties
-        case let .protocols(command):
-            return command.properties
+        case let .general(command): return command.properties
+        case let .mode1(command): return command.properties
+        case let .mode3(command): return command.properties
+        case let .mode4(command): return command.properties   // ✅ added
+        case let .mode6(command): return command.properties
+        case let .mode9(command): return command.properties
+        case let .protocols(command): return command.properties
         }
     }
 
@@ -114,11 +103,11 @@ public enum OBDCommand: Codable, Hashable, Comparable, Identifiable {
     public enum Protocols: CaseIterable, Codable, Comparable {
         case ATSP0
         case ATSP6
+
         public var properties: CommandProperties {
             switch self {
             case .ATSP0: return CommandProperties("ATSP0", "Auto protocol", 0, .none)
             case .ATSP6: return CommandProperties("ATSP6", "Auto protocol", 0, .none)
-
             }
         }
     }
@@ -220,97 +209,95 @@ public enum OBDCommand: Codable, Hashable, Comparable, Identifiable {
         case fuelInjectionTiming
         case fuelRate
         case emissionsReq
-		
-		// MARK: - Wikipedia / SAE J1979 additions (0x60 ... 0xC8)
 
-		// MARK: - Extended Mode 01 (61+)
+        // MARK: - Wikipedia / SAE J1979 additions (0x60 ... 0xC8)
+        // MARK: - Extended Mode 01 (61+)
 
-case pidsD
+        case pidsD
 
-case driversDemandTorque
-case actualEngineTorque
-case engineReferenceTorque
-case enginePercentTorqueData
-case auxInputOutputSupported
-case mafSensor
-case engineCoolantTempSensors
-case intakeAirTempSensors
-case egrActualCommandedError
-case dieselIntakeAirFlowControl
-case egrTemperature
-case throttleActuatorControl
-case fuelPressureControlSystem
-case injectionPressureControl
-case turboInletPressure
-case boostPressureControl
-case vgtControl
-case wastegateControl
-case exhaustPressure
-case turbochargerRPM
-case turboTemp1
-case turboTemp2
-case chargeAirCoolerTemp
-case egtBank1
-case egtBank2
-case dpfDiffPressure
-case dpfStatus
-case dpfTemperature
-case noxNTEStatus
-case pmNTEStatus
-case engineRunTimeTotal
+        case driversDemandTorque
+        case actualEngineTorque
+        case engineReferenceTorque
+        case enginePercentTorqueData
+        case auxInputOutputSupported
+        case mafSensor
+        case engineCoolantTempSensors
+        case intakeAirTempSensors
+        case egrActualCommandedError
+        case dieselIntakeAirFlowControl
+        case egrTemperature
+        case throttleActuatorControl
+        case fuelPressureControlSystem
+        case injectionPressureControl
+        case turboInletPressure
+        case boostPressureControl
+        case vgtControl
+        case wastegateControl
+        case exhaustPressure
+        case turbochargerRPM
+        case turboTemp1
+        case turboTemp2
+        case chargeAirCoolerTemp
+        case egtBank1
+        case egtBank2
+        case dpfDiffPressure
+        case dpfStatus
+        case dpfTemperature
+        case noxNTEStatus
+        case pmNTEStatus
+        case engineRunTimeTotal
 
-case pidsE
+        case pidsE
 
-case aecdRunTime1
-case aecdRunTime2
-case noxSensor
-case manifoldSurfaceTemp
-case noxReagentSystem
-case pmSensor
-case intakeManifoldPressure2
-case scrInduceSystem
-case aecdRunTime11to15
-case aecdRunTime16to20
-case dieselAftertreatment
-case o2WideRange
-case throttlePosG
-case engineFrictionTorque
-case pmSensorBank12
-case wwhOBDInfo1
-case wwhOBDInfo2
-case fuelSystemControl
-case wwhOBDCounters
-case noxWarningSystem
-case exhaustGasTempSensor1
-case exhaustGasTempSensor2
-case hybridBatteryData
-case defSensorData
-case o2SensorData
-case engineFuelRateAlt
-case engineExhaustFlowRate
-case fuelSystemPercentUse
+        case aecdRunTime1
+        case aecdRunTime2
+        case noxSensor
+        case manifoldSurfaceTemp
+        case noxReagentSystem
+        case pmSensor
+        case intakeManifoldPressure2
+        case scrInduceSystem
+        case aecdRunTime11to15
+        case aecdRunTime16to20
+        case dieselAftertreatment
+        case o2WideRange
+        case throttlePosG
+        case engineFrictionTorque
+        case pmSensorBank12
+        case wwhOBDInfo1
+        case wwhOBDInfo2
+        case fuelSystemControl
+        case wwhOBDCounters
+        case noxWarningSystem
+        case exhaustGasTempSensor1
+        case exhaustGasTempSensor2
+        case hybridBatteryData
+        case defSensorData
+        case o2SensorData
+        case engineFuelRateAlt
+        case engineExhaustFlowRate
+        case fuelSystemPercentUse
 
-case pidsF
+        case pidsF
 
-case noxSensorCorrected
-case cylinderFuelRate
-case evapSystemPressureAlt2
-case transmissionActualGear
-case commandedDEFdosing
-case odometer
-case noxSensorConc34
-case noxSensorCorrectedConc34
-case absDisableSwitch
+        case noxSensorCorrected
+        case cylinderFuelRate
+        case evapSystemPressureAlt2
+        case transmissionActualGear
+        case commandedDEFdosing
+        case odometer
+        case noxSensorConc34
+        case noxSensorCorrectedConc34
+        case absDisableSwitch
 
-case pidsG
+        case pidsG
 
-case fuelLevelInputAB
-case exhaustParticulateDiag
-case fuelPressureAB
-case particulateControlStatus
-case distanceSinceReflash
-case noxPMWarningLamp
-		
+        case fuelLevelInputAB
+        case exhaustParticulateDiag
+        case fuelPressureAB
+        case particulateControlStatus
+        case distanceSinceReflash
+        case noxPMWarningLamp
     }
 
     public enum Mode3: CaseIterable, Codable, Comparable {
@@ -420,7 +407,7 @@ case noxPMWarningLamp
         case MONITOR_MISFIRE_CYLINDER_12
         case MONITOR_PM_FILTER_B1
         case MONITOR_PM_FILTER_B2
-    }
+    } // ✅ this brace was missing in your pasted file
 
     public enum Mode9: CaseIterable, Codable, Comparable {
         case PIDS_9A
@@ -430,6 +417,7 @@ case noxPMWarningLamp
         case CALIBRATION_ID
         case CVN_MESSAGE_COUNT
         case CVN
+
         var properties: CommandProperties {
             switch self {
             case .PIDS_9A: return CommandProperties("0900", "Supported PIDs [01-20]", 7, .pid)
@@ -445,44 +433,38 @@ case noxPMWarningLamp
 
     static var pidGetters: [OBDCommand] = {
         var getters: [OBDCommand] = []
-        for command in OBDCommand.Mode1.allCases {
-            if command.properties.decoder == .pid {
-                getters.append(.mode1(command))
-            }
+
+        for command in OBDCommand.Mode1.allCases where command.properties.decoder == .pid {
+            getters.append(.mode1(command))
+        }
+        for command in OBDCommand.Mode6.allCases where command.properties.decoder == .pid {
+            getters.append(.mode6(command))
+        }
+        for command in OBDCommand.Mode9.allCases where command.properties.decoder == .pid {
+            getters.append(.mode9(command))
         }
 
-        for command in OBDCommand.Mode6.allCases {
-            if command.properties.decoder == .pid {
-                getters.append(.mode6(command))
-            }
-        }
-
-        for command in OBDCommand.Mode9.allCases {
-            if command.properties.decoder == .pid {
-                getters.append(.mode9(command))
-            }
-        }
         return getters
     }()
 
     static public var allCommands: [OBDCommand] = {
         var commands: [OBDCommand] = []
+
         for command in OBDCommand.General.allCases {
             commands.append(.general(command))
         }
-
         for command in OBDCommand.Mode1.allCases {
             commands.append(.mode1(command))
         }
-
         for command in OBDCommand.Mode3.allCases {
             commands.append(.mode3(command))
         }
-
+        for command in OBDCommand.Mode4.allCases {               // ✅ added
+            commands.append(.mode4(command))
+        }
         for command in OBDCommand.Mode6.allCases {
             commands.append(.mode6(command))
         }
-
         for command in OBDCommand.Mode9.allCases {
             commands.append(.mode9(command))
         }
@@ -609,49 +591,50 @@ extension OBDCommand.Mode1 {
         case .fuelInjectionTiming: return CommandProperties("015D", "Fuel injection timing", 4, .injectTiming, true)
         case .fuelRate: return CommandProperties("015E", "Engine fuel rate", 4, .fuelRate, true)
         case .emissionsReq: return CommandProperties("015F", "Designed emission requirements", 3, .none)
-			// MARK: - Extended Mode 01
 
-case .pidsD: return CommandProperties("0160", "Supported PIDs [61-80]", 5, .pid)
+        // MARK: - Extended Mode 01
 
-case .driversDemandTorque: return CommandProperties("0161", "Driver demand torque", 2, .percent, true)
-case .actualEngineTorque: return CommandProperties("0162", "Actual engine torque", 2, .percent, true)
-case .engineReferenceTorque: return CommandProperties("0163", "Engine reference torque", 3, .none, true)
-case .enginePercentTorqueData: return CommandProperties("0164", "Engine percent torque data", 6, .none, true)
-case .auxInputOutputSupported: return CommandProperties("0165", "Aux input/output supported", 3, .none)
-case .mafSensor: return CommandProperties("0166", "Mass air flow sensor", 6, .none, true)
-case .engineCoolantTempSensors: return CommandProperties("0167", "Coolant temp sensors", 4, .none, true)
-case .intakeAirTempSensors: return CommandProperties("0168", "Intake air temp sensors", 4, .none, true)
-case .egrActualCommandedError: return CommandProperties("0169", "EGR actual/commanded/error", 8, .none, true)
-case .dieselIntakeAirFlowControl: return CommandProperties("016A", "Diesel intake air flow control", 6, .none, true)
-case .egrTemperature: return CommandProperties("016B", "EGR temperature", 6, .none, true)
-case .throttleActuatorControl: return CommandProperties("016C", "Throttle actuator control", 6, .none, true)
-case .fuelPressureControlSystem: return CommandProperties("016D", "Fuel pressure control system", 12, .none, true)
-case .injectionPressureControl: return CommandProperties("016E", "Injection pressure control system", 10, .none, true)
-case .turboInletPressure: return CommandProperties("016F", "Turbo inlet pressure", 4, .pressure, true)
-case .boostPressureControl: return CommandProperties("0170", "Boost pressure control", 11, .none, true)
-case .vgtControl: return CommandProperties("0171", "VGT control", 7, .none, true)
-case .wastegateControl: return CommandProperties("0172", "Wastegate control", 6, .none, true)
-case .exhaustPressure: return CommandProperties("0173", "Exhaust pressure", 6, .none, true)
-case .turbochargerRPM: return CommandProperties("0174", "Turbocharger RPM", 6, .none, true)
-case .turboTemp1: return CommandProperties("0175", "Turbo temp 1", 8, .none, true)
-case .turboTemp2: return CommandProperties("0176", "Turbo temp 2", 8, .none, true)
-case .chargeAirCoolerTemp: return CommandProperties("0177", "Charge air cooler temp", 6, .temp, true)
-case .egtBank1: return CommandProperties("0178", "EGT Bank 1", 10, .none, true)
-case .egtBank2: return CommandProperties("0179", "EGT Bank 2", 10, .none, true)
-case .dpfDiffPressure: return CommandProperties("017A", "DPF differential pressure", 8, .none, true)
-case .dpfStatus: return CommandProperties("017B", "DPF status", 8, .none, true)
-case .dpfTemperature: return CommandProperties("017C", "DPF temperature", 10, .temp, true)
-case .noxNTEStatus: return CommandProperties("017D", "NOx NTE status", 2, .none)
-case .pmNTEStatus: return CommandProperties("017E", "PM NTE status", 2, .none)
-case .engineRunTimeTotal: return CommandProperties("017F", "Total engine run time", 14, .none, true)
+        case .pidsD: return CommandProperties("0160", "Supported PIDs [61-80]", 5, .pid)
 
-case .pidsE: return CommandProperties("0180", "Supported PIDs [81-A0]", 5, .pid)
+        case .driversDemandTorque: return CommandProperties("0161", "Driver demand torque", 2, .percent, true)
+        case .actualEngineTorque: return CommandProperties("0162", "Actual engine torque", 2, .percent, true)
+        case .engineReferenceTorque: return CommandProperties("0163", "Engine reference torque", 3, .none, true)
+        case .enginePercentTorqueData: return CommandProperties("0164", "Engine percent torque data", 6, .none, true)
+        case .auxInputOutputSupported: return CommandProperties("0165", "Aux input/output supported", 3, .none)
+        case .mafSensor: return CommandProperties("0166", "Mass air flow sensor", 6, .none, true)
+        case .engineCoolantTempSensors: return CommandProperties("0167", "Coolant temp sensors", 4, .none, true)
+        case .intakeAirTempSensors: return CommandProperties("0168", "Intake air temp sensors", 4, .none, true)
+        case .egrActualCommandedError: return CommandProperties("0169", "EGR actual/commanded/error", 8, .none, true)
+        case .dieselIntakeAirFlowControl: return CommandProperties("016A", "Diesel intake air flow control", 6, .none, true)
+        case .egrTemperature: return CommandProperties("016B", "EGR temperature", 6, .none, true)
+        case .throttleActuatorControl: return CommandProperties("016C", "Throttle actuator control", 6, .none, true)
+        case .fuelPressureControlSystem: return CommandProperties("016D", "Fuel pressure control system", 12, .none, true)
+        case .injectionPressureControl: return CommandProperties("016E", "Injection pressure control system", 10, .none, true)
+        case .turboInletPressure: return CommandProperties("016F", "Turbo inlet pressure", 4, .pressure, true)
+        case .boostPressureControl: return CommandProperties("0170", "Boost pressure control", 11, .none, true)
+        case .vgtControl: return CommandProperties("0171", "VGT control", 7, .none, true)
+        case .wastegateControl: return CommandProperties("0172", "Wastegate control", 6, .none, true)
+        case .exhaustPressure: return CommandProperties("0173", "Exhaust pressure", 6, .none, true)
+        case .turbochargerRPM: return CommandProperties("0174", "Turbocharger RPM", 6, .none, true)
+        case .turboTemp1: return CommandProperties("0175", "Turbo temp 1", 8, .none, true)
+        case .turboTemp2: return CommandProperties("0176", "Turbo temp 2", 8, .none, true)
+        case .chargeAirCoolerTemp: return CommandProperties("0177", "Charge air cooler temp", 6, .temp, true)
+        case .egtBank1: return CommandProperties("0178", "EGT Bank 1", 10, .none, true)
+        case .egtBank2: return CommandProperties("0179", "EGT Bank 2", 10, .none, true)
+        case .dpfDiffPressure: return CommandProperties("017A", "DPF differential pressure", 8, .none, true)
+        case .dpfStatus: return CommandProperties("017B", "DPF status", 8, .none, true)
+        case .dpfTemperature: return CommandProperties("017C", "DPF temperature", 10, .temp, true)
+        case .noxNTEStatus: return CommandProperties("017D", "NOx NTE status", 2, .none)
+        case .pmNTEStatus: return CommandProperties("017E", "PM NTE status", 2, .none)
+        case .engineRunTimeTotal: return CommandProperties("017F", "Total engine run time", 14, .none, true)
 
-case .aecdRunTime1: return CommandProperties("0181", "AECD run time", 42, .none, true)
-case .aecdRunTime2: return CommandProperties("0182", "AECD run time", 42, .none, true)
-case .noxSensor: return CommandProperties("0183", "NOx sensor", 10, .none, true)
-case .manifoldSurfaceTemp: return CommandProperties("0184", "Manifold surface temp", 2, .temp, true)
-case .noxReagentSystem: return CommandProperties("0185", "NOx reagent system", 11, .none, true)
+        case .pidsE: return CommandProperties("0180", "Supported PIDs [81-A0]", 5, .pid)
+
+        case .aecdRunTime1: return CommandProperties("0181", "AECD run time", 42, .none, true)
+        case .aecdRunTime2: return CommandProperties("0182", "AECD run time", 42, .none, true)
+        case .noxSensor: return CommandProperties("0183", "NOx sensor", 10, .none, true)
+        case .manifoldSurfaceTemp: return CommandProperties("0184", "Manifold surface temp", 2, .temp, true)
+        case .noxReagentSystem: return CommandProperties("0185", "NOx reagent system", 11, .none, true)
 case .pmSensor: return CommandProperties("0186", "PM sensor", 6, .none, true)
 case .intakeManifoldPressure2: return CommandProperties("0187", "Intake manifold pressure", 6, .pressure, true)
 case .scrInduceSystem: return CommandProperties("0188", "SCR induce system", 14, .none, true)
