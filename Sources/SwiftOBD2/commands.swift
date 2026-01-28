@@ -220,6 +220,123 @@ public enum OBDCommand: Codable, Hashable, Comparable, Identifiable {
         case fuelInjectionTiming
         case fuelRate
         case emissionsReq
+		
+		// MARK: - Wikipedia / SAE J1979 additions (0x60 ... 0xC8)
+
+case pidsD                        // 0160 Supported PIDs [61-80]
+case driversDemandTorque          // 0161
+case actualEngineTorque           // 0162
+case engineReferenceTorque        // 0163
+case enginePercentTorqueData      // 0164
+case auxInputOutputSupported      // 0165
+case mafSensor                    // 0166
+case engineCoolantTempSensors     // 0167
+case intakeAirTempSensors         // 0168
+case egrActualCommandedError      // 0169
+case dieselIntakeAirFlowControl   // 016A
+case egrTemperature               // 016B
+case throttleActuatorControl      // 016C
+case fuelPressureControlSystem    // 016D
+case injectionPressureControl     // 016E
+case turboCompressorInletPressure // 016F
+case boostPressureControl         // 0170
+case vgtControl                   // 0171
+case wastegateControl             // 0172
+case exhaustPressure              // 0173
+case turbochargerRPM              // 0174
+case turbochargerTemp1            // 0175
+case turbochargerTemp2            // 0176
+case chargeAirCoolerTemp          // 0177
+case egtBank1                     // 0178
+case egtBank2                     // 0179
+case dpfDifferentialPressure      // 017A
+case dpf                          // 017B
+case dpfTemperature               // 017C
+case noxNTEControlAreaStatus      // 017D
+case pmNTEControlAreaStatus       // 017E
+case engineRunTime                // 017F (note: different from your 011F runTime)
+
+case pidsE                        // 0180 Supported PIDs [81-A0]
+case aecdRunTime1                 // 0181
+case aecdRunTime2                 // 0182
+case noxSensor                    // 0183
+case manifoldSurfaceTemp          // 0184
+case noxReagentSystem             // 0185
+case particulateMatterSensor      // 0186
+case intakeManifoldAbsPressure2   // 0187
+case scrInduceSystem              // 0188
+case aecdRunTime11to15            // 0189
+case aecdRunTime16to20            // 018A
+case dieselAftertreatment         // 018B
+case o2SensorWideRange            // 018C
+case throttlePosG                 // 018D
+case engineFrictionTorque         // 018E
+case pmSensorBank1and2            // 018F
+case wwhObdInfo1                  // 0190
+case wwhObdInfo2                  // 0191
+case fuelSystemControl            // 0192
+case wwhObdCountersSupport        // 0193
+case noxWarningInducement         // 0194
+
+// Wikipedia table has gaps here; keep placeholders so the enum is “complete”.
+case pid95Reserved                // 0195
+case pid96Reserved                // 0196
+case pid97Reserved                // 0197
+
+case exhaustGasTempSensor1        // 0198
+case exhaustGasTempSensor2        // 0199
+case hybridEVBatteryData          // 019A
+case dieselExhaustFluidSensor     // 019B
+case o2SensorData                 // 019C
+case engineFuelRateAlt            // 019D
+case engineExhaustFlowRate        // 019E
+case fuelSystemPercentageUse      // 019F
+
+case pidsF                        // 01A0 Supported PIDs [A1-C0]
+case noxSensorCorrectedData       // 01A1
+case cylinderFuelRate             // 01A2
+case evapSystemVaporPressureAlt2  // 01A3
+case transmissionActualGear       // 01A4
+case commandedDEFdosing           // 01A5
+case odometer                     // 01A6
+case noxSensorConcentration3and4  // 01A7
+case noxSensorCorrectedConc3and4  // 01A8
+case absDisableSwitchState        // 01A9
+
+// Gap A A -> C0 in Wikipedia: keep placeholders so you can still represent “supported PIDs” bitmasks safely.
+case pidAAReserved
+case pidABReserved
+case pidACReserved
+case pidADReserved
+case pidAEReserved
+case pidAFReserved
+case pidB0Reserved
+case pidB1Reserved
+case pidB2Reserved
+case pidB3Reserved
+case pidB4Reserved
+case pidB5Reserved
+case pidB6Reserved
+case pidB7Reserved
+case pidB8Reserved
+case pidB9Reserved
+case pidBAReserved
+case pidBBReserved
+case pidBCReserved
+case pidBDReserved
+case pidBEReserved
+case pidBFReserved
+
+case pidsG                        // 01C0 Supported PIDs [C1-E0]
+case pidC1Reserved
+case pidC2Reserved
+case fuelLevelInputAB             // 01C3
+case exhaustParticulateDiagTimeCount // 01C4
+case fuelPressureAB               // 01C5
+case particulateControlStatus     // 01C6
+case distanceSinceReflash         // 01C7
+case noxParticulateWarningLamp    // 01C8
+		
     }
 
     public enum Mode3: CaseIterable, Codable, Comparable {
