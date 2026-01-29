@@ -61,7 +61,8 @@ final class ELM327 {
         category: "ELM327"
     )
 
-    private let comm: CommProtocol
+    // ✅ FIX: must be var (not let) because CommProtocol isn't guaranteed class-bound
+    private var comm: CommProtocol
     private var cancellables = Set<AnyCancellable>()
 
     weak var obdDelegate: OBDServiceDelegate? {
@@ -87,8 +88,11 @@ final class ELM327 {
                 guard let self else { return }
                 self.connectionState = state
                 self.obdDelegate?.connectionStateChanged(state: state)
-                self.logger.debug("Connection state updated: \(state.rawValue)")
-                postOBDLogEvent(level: "debug", category: .connection, message: "Connection state: \(state.rawValue)")
+
+                // ✅ FIX: ConnectionState has no rawValue
+                let stateText = String(describing: state)
+                self.logger.debug("Connection state updated: \(stateText)")
+                postOBDLogEvent(level: "debug", category: .connection, message: "Connection state: \(stateText)")
             }
             .store(in: &cancellables)
     }
