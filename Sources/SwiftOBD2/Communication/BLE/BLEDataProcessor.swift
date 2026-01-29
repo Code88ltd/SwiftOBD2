@@ -72,17 +72,17 @@ private func parseResponse(from string: String) -> [String] {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 
-    postOBDLogEvent(
-        level: "debug",
-        category: .communication,
-        message: """
-        Raw ELM response:
-        \(string)
+ postOBDLogEvent(
+    level: "debug",
+    category: OBDLogger.Category.communication,
+    message: """
+    Raw ELM response:
+    \(string)
 
-        Parsed lines:
-        \(lines.joined(separator: " | "))
-        """
-    )
+    Parsed lines:
+    \(lines.joined(separator: " | "))
+    """
+)
 
     return lines
 }
