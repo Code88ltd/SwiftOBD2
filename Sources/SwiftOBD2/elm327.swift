@@ -426,14 +426,14 @@ extension ELM327 {
                 // block "0900" => modePrefix "09"
                 let modePrefix = String(block.prefix(2))
 
-                let supportedCommands = OBDCommand.allCommands.filter { cmd in
-                    let cmdHex = sanitizeHex(cmd.properties.command)
-                    guard cmdHex.hasPrefix(modePrefix), cmdHex.count >= 4 else { return false }
-                    let pid = String(cmdHex.dropFirst(2))
-                    return supportedPidsByECU.contains(pid)
-                }
+let supportedCommands = OBDCommand.allCommands.filter { cmd in
+    let cmdHex = self.sanitizeHex(cmd.properties.command)
+    guard cmdHex.hasPrefix(modePrefix), cmdHex.count >= 4 else { return false }
+    let pid = String(cmdHex.dropFirst(2))
+    return supportedPidsByECU.contains(pid)
+}
 
-                logger.debug("Resolved commands for \(block): \(supportedCommands.map { sanitizeHex($0.properties.command) }.joined(separator: ", "))")
+logger.debug("Resolved commands for \(block): \(supportedCommands.map { self.sanitizeHex($0.properties.command) }.joined(separator: ", "))")
 
                 supportedPIDs.append(contentsOf: supportedCommands)
 
