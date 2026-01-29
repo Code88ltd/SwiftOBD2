@@ -72,9 +72,10 @@ private func parseResponse(from string: String) -> [String] {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 
-    LogStore.shared.debug(
-        "ELM327",
-        """
+    postOBDLogEvent(
+        level: "debug",
+        category: .communication,
+        message: """
         Raw ELM response:
         \(string)
 
