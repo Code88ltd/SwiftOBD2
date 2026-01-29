@@ -64,16 +64,27 @@ final class BLEMessageProcessor {
         }
     }
 
-    private func parseResponse(from string: String) -> [String] {
-        let lines = string
-            .replacingOccurrences(of: ">", with: "")
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+private func parseResponse(from string: String) -> [String] {
+    let cleaned = string.replacingOccurrences(of: ">", with: "")
 
-        logger.debug("Parsed response: \(lines)")
-        return lines
-    }
+    let lines = cleaned
+        .components(separatedBy: .newlines)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+    LogStore.shared.debug(
+        "ELM327",
+        """
+        Raw ELM response:
+        \(string)
+
+        Parsed lines:
+        \(lines.joined(separator: " | "))
+        """
+    )
+
+    return lines
+}
 
     private func handleParsedResponse(_ lines: [String]) {
         let completion = messageCompletion
