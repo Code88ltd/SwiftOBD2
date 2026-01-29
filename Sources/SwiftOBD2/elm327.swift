@@ -396,58 +396,72 @@ extension ELM327 {
 }
 
 extension ELM327 {
-    /// Get the supported PIDs
-    /// - Returns: Array of supported PIDs
     func getSupportedPIDs() async -> [OBDCommand] {
         let pidGetters = OBDCommand.pidGetters
         var supportedPIDs: [OBDCommand] = []
 
         for pidGetter in pidGetters {
+            let block = pidGetter.properties.command.cleanedHex.uppercased()
+
             do {
-                logger.info("Getting supported PIDs for \(pidGetter.properties.command)")
-                let response = try await sendCommand(pidGetter.properties.command)
-                // find first instance of 41 plus command sent, from there we determine the position of everything else
-                // Ex.
-                //        || ||
-                // 7E8 06 41 00 BE 7F B8 13
-                guard let supportedPidsByECU = parseResponse(response) else {
+                logger.info("Getting supported PIDs for \(block)")
+                let response = try await sendCommand(block)
+
+                guard let supportedPidsByECU = parseResponse(response, block: block) else {
                     continue
                 }
 
-                let supportedCommands = OBDCommand.allCommands
-                    .filter { supportedPidsByECU.contains(String($0.properties.command.dropFirst(2))) }
-                    .map { $0 }
+                let modePrefix = String(block.prefix(2)) // "01" or "09"
+
+                let supportedCommands = OBDCommand.allCommands.filter { cmd in
+                    let cmdHex = cmd.properties.command.cleanedHex.uppercased()
+                    guard cmdHex.hasPrefix(modePrefix), cmdHex.count >= 4 else { return false }
+                    let pid = String(cmdHex.dropFirst(2))
+                    return supportedPidsByECU.contains(pid)
+                }
 
                 supportedPIDs.append(contentsOf: supportedCommands)
             } catch {
                 logger.error("\(error.localizedDescription)")
             }
         }
-        // filter out pidGetters
-        supportedPIDs = supportedPIDs.filter { !pidGetters.contains($0) }
 
-        // remove duplicates
+        supportedPIDs = supportedPIDs.filter { !pidGetters.contains($0) }
         return Array(Set(supportedPIDs))
     }
 
-    private func parseResponse(_ response: [String]) -> Set<String>? {
+    private func parseResponse(_ response: [String], block: String) -> Set<String>? {
         guard let ecuData = try? canProtocol?.parse(response).first?.data else {
             return nil
         }
         let binaryData = BitArray(data: ecuData.dropFirst()).binaryArray
-        return extractSupportedPIDs(binaryData)
+        return extractSupportedPIDs(binaryData, block: block)
     }
 
-    func extractSupportedPIDs(_ binaryData: [Int]) -> Set<String> {
-        var supportedPIDs: Set<String> = []
+    func extractSupportedPIDs(_ binaryData: [Int], block: String) -> Set<String> {
+        var supported: Set<String> = []
 
-        for (index, value) in binaryData.enumerated() {
-            if value == 1 {
-                let pid = String(format: "%02X", index + 1)
-                supportedPIDs.insert(pid)
-            }
+        let base: Int
+        switch block.cleanedHex.uppercased() {
+        case "0100": base = 0x00
+        case "0120": base = 0x20
+        case "0140": base = 0x40
+        case "0160": base = 0x60
+        case "0180": base = 0x80
+        case "01A0": base = 0xA0
+        case "01C0": base = 0xC0
+        case "0900": base = 0x00
+        default:
+            base = 0x00
+            postOBDLogEvent(level: "warning", category: .parsing, message: "Unknown PID block \(block) (default base=0)")
         }
-        return supportedPIDs
+
+        for (index, bit) in binaryData.enumerated() where bit == 1 {
+            let pidValue = base + index + 1
+            supported.insert(String(format: "%02X", pidValue))
+        }
+
+        return supported
     }
 }
 
