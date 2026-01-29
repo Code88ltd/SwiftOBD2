@@ -561,7 +561,7 @@ extension OBDCommand.Mode1 {
         case .catalystTempB2S2: return CommandProperties("013F", "Catalyst Temperature: Bank 1 - Sensor 2", 4, .uas(0x16), true)
         case .pidsC: return CommandProperties("0140", "Supported PIDs [41-60]", 6, .pid)
         case .statusDriveCycle: return CommandProperties("0141", "Monitor status this drive cycle", 6, .status)
-        case .controlModuleVoltage: return CommandProperties("0142", "Control module voltage", 4, .uas(0x0B), true)
+        case .controlModuleVoltage: return CommandProperties("0142", "Control module voltage", 3, .uas(0x0B), true)
         case .absoluteLoad: return CommandProperties("0143", "Absolute load value", 4, .percent, true)
         case .commandedEquivRatio: return CommandProperties("0144", "Commanded equivalence ratio", 4, .uas(0x1E), true)
         case .relativeThrottlePos: return CommandProperties("0145", "Relative throttle position", 4, .percent, true)
