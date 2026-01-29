@@ -396,58 +396,75 @@ extension ELM327 {
 }
 
 extension ELM327 {
-    /// Get the supported PIDs
-    /// - Returns: Array of supported PIDs
+
     func getSupportedPIDs() async -> [OBDCommand] {
         let pidGetters = OBDCommand.pidGetters
         var supportedPIDs: [OBDCommand] = []
 
+        LogStore.shared.info(
+            "OBD",
+            "Starting supported PID discovery (\(pidGetters.count) blocks)"
+        )
+
         for pidGetter in pidGetters {
+            let block = pidGetter.properties.command
+
             do {
-                logger.info("Getting supported PIDs for \(pidGetter.properties.command)")
-                let response = try await sendCommand(pidGetter.properties.command)
-                // find first instance of 41 plus command sent, from there we determine the position of everything else
-                // Ex.
-                //        || ||
-                // 7E8 06 41 00 BE 7F B8 13
-                guard let supportedPidsByECU = parseResponse(response) else {
+                LogStore.shared.debug(
+                    "OBD",
+                    "Requesting supported PID block \(block)"
+                )
+
+                let response = try await sendCommand(block)
+
+                LogStore.shared.debug(
+                    "OBD",
+                    "Raw ECU response \(block): \(response.joined(separator: " | "))"
+                )
+
+                guard let supportedPidsByECU = parseResponse(response, block: block) else {
+                    LogStore.shared.warning(
+                        "OBD",
+                        "No parsable PID data for block \(block)"
+                    )
                     continue
                 }
 
-                let supportedCommands = OBDCommand.allCommands
-                    .filter { supportedPidsByECU.contains(String($0.properties.command.dropFirst(2))) }
-                    .map { $0 }
+                LogStore.shared.info(
+                    "OBD",
+                    "ECU advertises \(supportedPidsByECU.count) PIDs for \(block): " +
+                    supportedPidsByECU.sorted().joined(separator: ", ")
+                )
+
+                let supportedCommands = OBDCommand.allCommands.filter {
+                    supportedPidsByECU.contains(String($0.properties.command.dropFirst(2)))
+                }
+
+                LogStore.shared.debug(
+                    "OBD",
+                    "Resolved commands for \(block): " +
+                    supportedCommands.map { $0.properties.command }.joined(separator: ", ")
+                )
 
                 supportedPIDs.append(contentsOf: supportedCommands)
+
             } catch {
-                logger.error("\(error.localizedDescription)")
+                LogStore.shared.error(
+                    "OBD",
+                    "PID block \(block) failed: \(error.localizedDescription)"
+                )
             }
         }
-        // filter out pidGetters
+
         supportedPIDs = supportedPIDs.filter { !pidGetters.contains($0) }
+        let unique = Array(Set(supportedPIDs))
 
-        // remove duplicates
-        return Array(Set(supportedPIDs))
-    }
+        LogStore.shared.info(
+            "OBD",
+            "Supported PID discovery complete: \(unique.count) total PIDs"
+        )
 
-    private func parseResponse(_ response: [String]) -> Set<String>? {
-        guard let ecuData = try? canProtocol?.parse(response).first?.data else {
-            return nil
-        }
-        let binaryData = BitArray(data: ecuData.dropFirst()).binaryArray
-        return extractSupportedPIDs(binaryData)
-    }
-
-    func extractSupportedPIDs(_ binaryData: [Int]) -> Set<String> {
-        var supportedPIDs: Set<String> = []
-
-        for (index, value) in binaryData.enumerated() {
-            if value == 1 {
-                let pid = String(format: "%02X", index + 1)
-                supportedPIDs.insert(pid)
-            }
-        }
-        return supportedPIDs
+        return unique
     }
 }
 
