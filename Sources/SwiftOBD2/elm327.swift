@@ -396,53 +396,84 @@ extension ELM327 {
 }
 
 extension ELM327 {
+
+    /// Get the supported PIDs
+    /// - Returns: Array of supported PIDs
     func getSupportedPIDs() async -> [OBDCommand] {
         let pidGetters = OBDCommand.pidGetters
         var supportedPIDs: [OBDCommand] = []
 
+        logger.info("Starting supported PID discovery (\(pidGetters.count) blocks)")
+
         for pidGetter in pidGetters {
-            let block = pidGetter.properties.command.cleanedHex.uppercased()
+            let block = sanitizeHex(pidGetter.properties.command)
 
             do {
-                logger.info("Getting supported PIDs for \(block)")
+                logger.debug("Requesting supported PID block \(block)")
                 let response = try await sendCommand(block)
 
-                guard let supportedPidsByECU = parseResponse(response, block: block) else {
+                logger.debug("Raw ECU response \(block): \(response.joined(separator: " | "))")
+
+                guard let supportedPidsByECU = parseSupportedPIDBlock(response, block: block) else {
+                    logger.warning("No parsable PID data for block \(block)")
                     continue
                 }
 
-                let modePrefix = String(block.prefix(2)) // "01" or "09"
+                logger.info("ECU advertises \(supportedPidsByECU.count) PIDs for \(block): \(supportedPidsByECU.sorted().joined(separator: ", "))")
+
+                // ✅ Important: match by MODE as well as PID
+                // block "0100" => modePrefix "01"
+                // block "0900" => modePrefix "09"
+                let modePrefix = String(block.prefix(2))
 
                 let supportedCommands = OBDCommand.allCommands.filter { cmd in
-                    let cmdHex = cmd.properties.command.cleanedHex.uppercased()
+                    let cmdHex = sanitizeHex(cmd.properties.command)
                     guard cmdHex.hasPrefix(modePrefix), cmdHex.count >= 4 else { return false }
                     let pid = String(cmdHex.dropFirst(2))
                     return supportedPidsByECU.contains(pid)
                 }
 
+                logger.debug("Resolved commands for \(block): \(supportedCommands.map { sanitizeHex($0.properties.command) }.joined(separator: ", "))")
+
                 supportedPIDs.append(contentsOf: supportedCommands)
+
             } catch {
-                logger.error("\(error.localizedDescription)")
+                logger.error("PID block \(block) failed: \(error.localizedDescription)")
             }
         }
 
+        // filter out pidGetters
         supportedPIDs = supportedPIDs.filter { !pidGetters.contains($0) }
-        return Array(Set(supportedPIDs))
+
+        // remove duplicates
+        let unique = Array(Set(supportedPIDs))
+        logger.info("Supported PID discovery complete: \(unique.count) total PIDs")
+
+        return unique
     }
 
-    private func parseResponse(_ response: [String], block: String) -> Set<String>? {
+    /// Parse one supported-PID block response into a set of PID hex strings ("01"..."20" etc),
+    /// adjusted for the block (0100, 0120, 0140...).
+    private func parseSupportedPIDBlock(_ response: [String], block: String) -> Set<String>? {
         guard let ecuData = try? canProtocol?.parse(response).first?.data else {
             return nil
         }
+
+        // ecuData typically begins with: [0x41, 0x00, ...] (or [0x49, 0x00, ...] for Mode 09)
+        // BitArray expects the 4 bytes after the mode/pid bytes, but your existing approach was dropFirst().
+        // Keep your behavior: dropFirst() removes the first byte.
         let binaryData = BitArray(data: ecuData.dropFirst()).binaryArray
         return extractSupportedPIDs(binaryData, block: block)
     }
 
+    /// Converts the 32-bit map into PIDs for the requested block.
     func extractSupportedPIDs(_ binaryData: [Int], block: String) -> Set<String> {
         var supported: Set<String> = []
 
+        let blockHex = sanitizeHex(block)
+
         let base: Int
-        switch block.cleanedHex.uppercased() {
+        switch blockHex {
         case "0100": base = 0x00
         case "0120": base = 0x20
         case "0140": base = 0x40
@@ -450,10 +481,10 @@ extension ELM327 {
         case "0180": base = 0x80
         case "01A0": base = 0xA0
         case "01C0": base = 0xC0
-        case "0900": base = 0x00
+        case "0900": base = 0x00   // Mode 09 supported-info PIDs (00-20)
         default:
             base = 0x00
-            postOBDLogEvent(level: "warning", category: .parsing, message: "Unknown PID block \(block) (default base=0)")
+            logger.warning("Unknown PID block \(blockHex) (default base=0)")
         }
 
         for (index, bit) in binaryData.enumerated() where bit == 1 {
@@ -461,7 +492,20 @@ extension ELM327 {
             supported.insert(String(format: "%02X", pidValue))
         }
 
+        logger.debug("Extracted supported PIDs \(blockHex): \(supported.sorted().joined(separator: ", "))")
+
         return supported
+    }
+
+    // MARK: - Local helpers (no dependency on String.cleanedHex)
+
+    /// Removes spaces/newlines/">" and uppercases for stable comparisons.
+    private func sanitizeHex(_ s: String) -> String {
+        s.uppercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: ">", with: "")
     }
 }
 
