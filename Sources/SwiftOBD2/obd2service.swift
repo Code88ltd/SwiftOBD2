@@ -20,8 +20,12 @@ public extension Notification.Name {
 
 // MARK: - ✅ NotificationCenter log bridge helper
 // Posts logs from SwiftOBD2 module so the host app can forward them into LogStore.shared.
+//
+// ✅ IMPORTANT CHANGE:
+// This was `private` before. That prevents other Swift files (like ELM327+SupportedPIDs.swift)
+// from calling it. Making it internal fixes that while keeping it module-scoped.
 
-private func postOBDLogEvent(level: String, category: OBDLogger.Category, message: String) {
+func postOBDLogEvent(level: String, category: OBDLogger.Category, message: String) {
     let payload: [String: Any] = [
         "level": level,
         "category": category.rawValue,
@@ -263,10 +267,6 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// ✅ Batched Mode01 requests. Serialized behind requestLock.
-    ///
-    /// IMPORTANT CHANGE:
-    /// - Removed the "single PID special-case decode" because it often slices the wrong bytes.
-    /// - Always decode using BatchedResponse (same behavior as your original working file).
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
         try await requestLock.withLock {
 
@@ -335,9 +335,31 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// ✅ Supported PIDs. Serialized too.
+    ///
+    /// ✅ CHANGE:
+    /// - Adds a log line listing the supported PID commands returned (so your app can show them).
     public func getSupportedPIDs() async -> [OBDCommand] {
         (try? await requestLock.withLock {
-            await elm327.getSupportedPIDs()
+            postOBDLogEvent(level: "info", category: .communication, message: "Starting supported PID discovery…")
+
+            let pids = await elm327.getSupportedPIDs()
+
+            if pids.isEmpty {
+                postOBDLogEvent(level: "warning", category: .communication, message: "Supported PID discovery returned 0 PIDs")
+            } else {
+                let list = pids
+                    .map { $0.properties.command.cleanedHex.uppercased() }
+                    .sorted()
+                    .joined(separator: ", ")
+
+                postOBDLogEvent(
+                    level: "debug",
+                    category: .communication,
+                    message: "Supported PID commands (\(pids.count)): \(list)"
+                )
+            }
+
+            return pids
         }) ?? []
     }
 
@@ -424,13 +446,12 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             }
 
             return lines
-                } catch {
+        } catch {
             let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
 
-            // "NO DATA" is a normal outcome for unsupported PIDs (many ECUs advertise a PID map
-            // that differs from what individual sub-modules respond to).
-            // The BLE stack reports this as BLEManagerError.noData (error 5). Don't fail the whole
-            // command; instead return an empty response so callers can treat the value as missing.
+            // "NO DATA" is a normal outcome for unsupported PIDs.
+            // BLE stack reports this as BLEManagerError.noData (error 5).
+            // Don't fail the whole command; instead return empty so callers treat missing.
             if let ble = error as? BLEManagerError {
                 switch ble {
                 case .noData:
