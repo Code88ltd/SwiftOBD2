@@ -209,6 +209,17 @@ extension OBDCommand {
                     return "00 BE 3F A8 13 00"
                 case .status:
                     return "01 12 34 56 78 00"
+                 case .controlModuleVoltage:   // PID 0x42
+    // 01 42 => returns A,B where volts = (256*A + B) / 1000
+    let volts = Double.random(in: 11.8...14.8)  // adjust range if you want
+    let raw = Int(volts * 1000.0)               // millivolts
+    let A = raw / 256
+    let B = raw % 256
+
+    let hexA = String(format: "%02X", A)
+    let hexB = String(format: "%02X", B)
+
+    return "42 \(hexA) \(hexB)"
                 case .pidsB:
                     return "20 90 07 E0 11 00"
                 case .pidsC:
