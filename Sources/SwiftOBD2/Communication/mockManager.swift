@@ -402,7 +402,7 @@ case .pidsG:
             case .PIDS_9A:
                     return "00 55 40 00 00 00"
             case .VIN:
-                return "02 01 31 4E 34 41 4C 33 41 50 37 44 43 31 39 39 35 38 33"
+                return "01 01 31 4E 24 41 4C 33 40 50 37 44 43 31 39 39 35 35 33"
             default:
                 return nil
             }
