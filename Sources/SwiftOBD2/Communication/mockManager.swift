@@ -145,7 +145,7 @@ class MOCKComm: CommProtocol {
 
         } else if command == "03" {
             // 03 is a request for DTCs
-            let dtcs = ["P0135", "P0141", "P0171"]
+            let dtcs = ["P0135", "P0141"]
             var response = ""
             // convert to hex
             for dtc in dtcs {
