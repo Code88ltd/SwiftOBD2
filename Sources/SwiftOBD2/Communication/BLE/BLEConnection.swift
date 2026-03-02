@@ -58,6 +58,7 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         CBUUID(string: "FFE0"),
         CBUUID(string: "FFF0"),
         CBUUID(string: "18F0"), // e.g. VGate iCar Pro
+          CBUUID(string: "FFF1"),
     ]
 
     // MARK: - Connection Management
