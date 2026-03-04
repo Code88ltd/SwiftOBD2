@@ -2,15 +2,18 @@
 //  EAManager.swift
 //  SwiftOBD2 (or your app target if you’ve forked it)
 //
-//  Drop-in replacement with:
-//  ✅ SwiftOBD2Logger.post(...) everywhere (bridges to your app via NotificationCenter)
-//  ✅ attemptId per connect attempt (correlate in Supabase)
-//  ✅ adapter/transport meta on every log line automatically
-//  ✅ rich diagnostics: accessory list, session/stream statuses, stream errors, TX/RX summaries
+//  Copy/paste replacement
 //
-//  NOTE:
-//  - This compiles without the “-1 overflows UInt” issue.
-//  - If you keep this inside the SwiftOBD2 package, your app bridge will catch it.
+//  Fixes:
+//  ✅ write() == 0 on EA streams is NOT fatal (wait + retry)
+//  ✅ Waits for output.hasSpaceAvailable before writing
+//  ✅ Removes streams from the same RunLoop/mode they were scheduled on
+//  ✅ Schedules streams on .common (more robust)
+//
+//  Keeps your:
+//  ✅ SwiftOBD2Logger.post(...) bridge
+//  ✅ attemptId correlation
+//  ✅ rich diagnostics
 //
 
 import Combine
@@ -60,10 +63,10 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     private var buffer = Data()
     private var messageCompletion: (([String]?, Error?) -> Void)?
 
-    // ✅ Match BLE behavior: prevent concurrent commands
+    // ✅ Prevent concurrent commands
     private let commandLock = AsyncLock()
 
-    // Use a queue for stream processing
+    // Use a queue for buffer processing
     private let ioQueue = DispatchQueue(label: "com.swiftobd2.ea.io", qos: .userInitiated)
 
     // MARK: - Lifecycle
@@ -169,7 +172,8 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
             "outputErr": output?.streamError?.localizedDescription ?? "nil"
         ])
 
-        ioQueue.sync {
+        // Ensure we tear down on main to match stream scheduling
+        DispatchQueue.main.sync {
             self.buffer.removeAll()
 
             let completion = self.messageCompletion
@@ -180,8 +184,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
             self.output?.close()
             self.input?.delegate = nil
             self.output?.delegate = nil
-            self.input?.remove(from: .current, forMode: .default)
-            self.output?.remove(from: .current, forMode: .default)
+
+            // ✅ Remove from SAME RunLoop + mode we used to schedule
+            self.input?.remove(from: .main, forMode: .common)
+            self.output?.remove(from: .main, forMode: .common)
+
             self.input = nil
             self.output = nil
             self.session = nil
@@ -197,7 +204,7 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
     func scanForPeripherals() async throws {
         post(.debug, "scanForPeripherals no-op (ExternalAccessory)")
-        // ExternalAccessory cannot scan. No-op to match your CommProtocol.
+        // ExternalAccessory cannot scan. No-op.
     }
 
     func sendCommand(_ command: String, retries: Int) async throws -> [String] {
@@ -268,7 +275,7 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
             "connectedAccessories": "\(accessories.count)"
         ])
 
-        // Log everything iOS sees (key diagnostic)
+        // Log everything iOS sees
         if !accessories.isEmpty {
             for acc in accessories {
                 post(.debug, "EA accessory seen", meta: [
@@ -308,14 +315,13 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         input?.delegate = self
         output?.delegate = self
 
-        // IMPORTANT: schedule streams on a run loop (main run loop is fine)
-        input?.schedule(in: .main, forMode: .default)
-        output?.schedule(in: .main, forMode: .default)
+        // ✅ More robust: .common mode
+        input?.schedule(in: .main, forMode: .common)
+        output?.schedule(in: .main, forMode: .common)
 
         input?.open()
         output?.open()
 
-        // streamStatus.rawValue is UInt -> NEVER use -1
         let inputStatus = input.map { String($0.streamStatus.rawValue) } ?? "nil"
         let outputStatus = output.map { String($0.streamStatus.rawValue) } ?? "nil"
 
@@ -329,33 +335,70 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         return true
     }
 
+    /// ✅ FIX: EA output.write() may return 0 temporarily; wait + retry (do NOT treat as fatal)
     private func writeCommand(_ command: String) throws {
         guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
         guard let data = "\(command)\r".data(using: .ascii) else { throw BLEManagerError.stringConversionFailed }
 
         post(.debug, "TX", meta: ["command": command])
 
+        // EA streams often need a moment after open before accepting bytes.
+        let start = CFAbsoluteTimeGetCurrent()
+        let timeout: TimeInterval = 2.0
+
         try data.withUnsafeBytes { ptr in
             guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else {
                 throw BLEManagerError.incorrectDataConversion
             }
 
-            var remaining: Int = ptr.count
-            var offset: Int = 0
+            var remaining = ptr.count
+            var offset = 0
 
             while remaining > 0 {
-                let written: Int = output.write(base.advanced(by: offset), maxLength: remaining)
-                if written <= 0 {
-                    post(.error, "write failed", meta: [
-                        "command": command,
-                        "written": "\(written)",
-                        "streamErr": output.streamError?.localizedDescription ?? "nil"
-                    ])
-                    throw BLEManagerError.sendMessageTimeout
+
+                // Wait until output reports space
+                while !output.hasSpaceAvailable {
+                    if (CFAbsoluteTimeGetCurrent() - start) > timeout {
+                        post(.error, "write timeout waiting for hasSpaceAvailable", meta: [
+                            "command": command,
+                            "outputStatus": "\(output.streamStatus.rawValue)",
+                            "streamErr": output.streamError?.localizedDescription ?? "nil"
+                        ])
+                        throw BLEManagerError.sendMessageTimeout
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
                 }
 
-                remaining -= written
-                offset += written
+                let written = output.write(base.advanced(by: offset), maxLength: remaining)
+
+                if written > 0 {
+                    remaining -= written
+                    offset += written
+                    continue
+                }
+
+                if written == 0 {
+                    // Not fatal: just means “try again soon”
+                    if (CFAbsoluteTimeGetCurrent() - start) > timeout {
+                        post(.error, "write returned 0 repeatedly (timeout)", meta: [
+                            "command": command,
+                            "outputStatus": "\(output.streamStatus.rawValue)",
+                            "streamErr": output.streamError?.localizedDescription ?? "nil"
+                        ])
+                        throw BLEManagerError.sendMessageTimeout
+                    }
+                    Thread.sleep(forTimeInterval: 0.01)
+                    continue
+                }
+
+                // written < 0 => real error
+                post(.error, "write failed (<0)", meta: [
+                    "command": command,
+                    "written": "\(written)",
+                    "outputStatus": "\(output.streamStatus.rawValue)",
+                    "streamErr": output.streamError?.localizedDescription ?? "nil"
+                ])
+                throw output.streamError ?? BLEManagerError.sendMessageTimeout
             }
         }
     }
@@ -371,7 +414,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
             let lines = try await withTimeout(seconds: timeout, timeoutError: BLEManagerError.timeout) {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
 
-                    // Defensive: should never happen due to commandLock
                     if self.messageCompletion != nil {
                         self.post(.error, "concurrentCommand detected", meta: [
                             "lastCommand": self.lastCommand ?? "nil"
@@ -404,7 +446,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
     }
 
-    /// Mirrors BLEMessageProcessor.parseResponse(from:)
     private func parseResponse(from string: String) -> [String] {
         let cleaned = string.replacingOccurrences(of: ">", with: "")
         return cleaned
