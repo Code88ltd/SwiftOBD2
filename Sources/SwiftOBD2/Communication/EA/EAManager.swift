@@ -291,40 +291,35 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         return true
     }
 
-    private func writeCommand(_ command: String) throws {
-        guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
-        guard let data = "\(command)\r".data(using: .ascii) else { throw BLEManagerError.stringConversionFailed }
+  private func writeCommand(_ command: String) throws {
+    guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
+    guard let data = "\(command)\r".data(using: .ascii) else { throw BLEManagerError.stringConversionFailed }
 
-        post(.debug, "writeCommand", meta: [
-            "command": command,
-            "bytes": "\(data.count)",
-            "outputStatus": "\(output.streamStatus.rawValue)"
-        ])
+    SwiftOBD2Logger.post(.debug, category: "EA", "TX \(command)")
 
-        logger.debug("Sending EA command: \(command, privacy: .public)")
+    try data.withUnsafeBytes { ptr in
+        guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else {
+            throw BLEManagerError.incorrectDataConversion
+        }
 
-        try data.withUnsafeBytes { ptr in
-            guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else {
-                throw BLEManagerError.incorrectDataConversion
+        var remaining: Int = ptr.count
+        var offset: Int = 0
+
+        while remaining > 0 {
+            let written: Int = output.write(base.advanced(by: offset), maxLength: remaining)
+
+            if written <= 0 {
+                SwiftOBD2Logger.post(.error, category: "EA", "Write failed (written=\(written))", meta: [
+                    "command": command
+                ])
+                throw BLEManagerError.sendMessageTimeout
             }
-            var remaining = ptr.count
-            var offset = 0
-            while remaining > 0 {
-                let written = output.write(base.advanced(by: offset), maxLength: remaining)
-                if written <= 0 {
-                    post(.error, "output.write failed", meta: [
-                        "command": command,
-                        "written": "\(written)",
-                        "streamError": output.streamError?.localizedDescription ?? "nil",
-                        "outputStatus": "\(output.streamStatus.rawValue)"
-                    ])
-                    throw BLEManagerError.sendMessageTimeout
-                }
-                remaining -= written
-                offset += written
-            }
+
+            remaining -= written
+            offset += written
         }
     }
+}
 
     /// Mirrors BLEMessageProcessor.waitForResponse(timeout:)
     private func waitForResponse(timeout: TimeInterval) async throws -> [String] {
