@@ -227,69 +227,73 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
     // MARK: - Internals
 
-    private func openSessionIfAvailable() throws -> Bool {
-        let accessories = EAAccessoryManager.shared().connectedAccessories
+   private func openSessionIfAvailable() throws -> Bool {
+    let accessories = EAAccessoryManager.shared().connectedAccessories
 
-        post(.debug, "openSessionIfAvailable", meta: [
-            "connectedAccessories": "\(accessories.count)",
+    post(.debug, "openSessionIfAvailable", meta: [
+        "connectedAccessories": "\(accessories.count)",
+        "protocolWanted": protocolString
+    ])
+
+    // Log what iOS can currently see (key diagnostic)
+    if !accessories.isEmpty {
+        for acc in accessories {
+            post(.debug, "EA accessory seen", meta: [
+                "name": acc.name,
+                "manufacturer": acc.manufacturer,
+                "modelNumber": acc.modelNumber,
+                "serialNumber": acc.serialNumber,
+                "connectionID": "\(acc.connectionID)",
+                "protocols": acc.protocolStrings.joined(separator: ",")
+            ])
+        }
+    }
+
+    guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
+        post(.debug, "no accessory matched protocol", meta: [
             "protocolWanted": protocolString
         ])
-
-        // Log what iOS can currently see (this is the key diagnostic)
-        if !accessories.isEmpty {
-            for acc in accessories {
-                post(.debug, "EA accessory seen", meta: [
-                    "name": acc.name,
-                    "manufacturer": acc.manufacturer,
-                    "modelNumber": acc.modelNumber,
-                    "serialNumber": acc.serialNumber,
-                    "connectionID": "\(acc.connectionID)",
-                    "protocols": acc.protocolStrings.joined(separator: ",")
-                ])
-            }
-        }
-
-        guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
-            post(.debug, "no accessory matched protocol", meta: [
-                "protocolWanted": protocolString
-            ])
-            return false
-        }
-
-        accessory = acc
-
-        guard let sess = EASession(accessory: acc, forProtocol: protocolString) else {
-            post(.error, "EASession returned nil", meta: [
-                "accessory": acc.name,
-                "protocol": protocolString
-            ])
-            throw BLEManagerError.unknownError
-        }
-
-        session = sess
-        input = sess.inputStream
-        output = sess.outputStream
-
-        input?.delegate = self
-        output?.delegate = self
-
-        // IMPORTANT: schedule streams on a run loop
-        input?.schedule(in: .main, forMode: .default)
-        output?.schedule(in: .main, forMode: .default)
-
-        input?.open()
-        output?.open()
-
-        post(.info, "EA session opened", meta: [
-            "accessory": acc.name,
-            "protocol": protocolString,
-            "inputStatus": "\(input?.streamStatus.rawValue ?? -1)",
-            "outputStatus": "\(output?.streamStatus.rawValue ?? -1)"
-        ])
-
-        logger.info("EA session opened: \(acc.name, privacy: .public)")
-        return true
+        return false
     }
+
+    accessory = acc
+
+    guard let sess = EASession(accessory: acc, forProtocol: protocolString) else {
+        post(.error, "EASession returned nil", meta: [
+            "accessory": acc.name,
+            "protocol": protocolString
+        ])
+        throw BLEManagerError.unknownError
+    }
+
+    session = sess
+    input = sess.inputStream
+    output = sess.outputStream
+
+    input?.delegate = self
+    output?.delegate = self
+
+    // IMPORTANT: schedule streams on a run loop
+    input?.schedule(in: .main, forMode: .default)
+    output?.schedule(in: .main, forMode: .default)
+
+    input?.open()
+    output?.open()
+
+    // ✅ rawValue is UInt, so DO NOT use -1
+    let inputStatus = input.map { String($0.streamStatus.rawValue) } ?? "nil"
+    let outputStatus = output.map { String($0.streamStatus.rawValue) } ?? "nil"
+
+    post(.info, "EA session opened", meta: [
+        "accessory": acc.name,
+        "protocol": protocolString,
+        "inputStatus": inputStatus,
+        "outputStatus": outputStatus
+    ])
+
+    logger.info("EA session opened: \(acc.name, privacy: .public)")
+    return true
+}
 
   private func writeCommand(_ command: String) throws {
     guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
