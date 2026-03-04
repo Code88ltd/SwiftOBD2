@@ -1,3 +1,18 @@
+//
+//  EAManager.swift
+//  SwiftOBD2 (or your app target if you’ve forked it)
+//
+//  Drop-in replacement with:
+//  ✅ SwiftOBD2Logger.post(...) everywhere (bridges to your app via NotificationCenter)
+//  ✅ attemptId per connect attempt (correlate in Supabase)
+//  ✅ adapter/transport meta on every log line automatically
+//  ✅ rich diagnostics: accessory list, session/stream statuses, stream errors, TX/RX summaries
+//
+//  NOTE:
+//  - This compiles without the “-1 overflows UInt” issue.
+//  - If you keep this inside the SwiftOBD2 package, your app bridge will catch it.
+//
+
 import Combine
 import CoreBluetooth // only because CommProtocol references CBPeripheral
 import ExternalAccessory
@@ -12,17 +27,27 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     public weak var obdDelegate: OBDServiceDelegate?
 
     // MARK: - Config
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.swiftobd2.app",
-                                category: "EAManager")
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.swiftobd2.app",
+        category: "EAManager"
+    )
     private let protocolString = "com.obdlink"
 
     // MARK: - SwiftOBD2 log bridge (to app via NotificationCenter)
     private let logCategory = "EA"
+
+    private var attemptId: String = ""
+    private var selectedAdapterLabel: String = "OBDLink (EA)"
     private var lastCommand: String?
     private var openAttempts: Int = 0
 
     private func post(_ level: SwiftOBD2LogLevel, _ message: String, meta: [String: String]? = nil) {
-        SwiftOBD2Logger.post(level, category: logCategory, message, meta: meta)
+        var m = meta ?? [:]
+        if !attemptId.isEmpty { m["attemptId"] = attemptId }
+        m["adapter"] = selectedAdapterLabel
+        m["transport"] = "ea"
+        m["protocol"] = protocolString
+        SwiftOBD2Logger.post(level, category: logCategory, message, meta: m)
     }
 
     // MARK: - EA session
@@ -47,16 +72,20 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
         EAAccessoryManager.shared().registerForLocalNotifications()
 
-        NotificationCenter.default.addObserver(self,
-                                               selector: #selector(accessoryDidConnect(_:)),
-                                               name: .EAAccessoryDidConnect,
-                                               object: nil)
-        NotificationCenter.default.addObserver(self,
-                                               selector: #selector(accessoryDidDisconnect(_:)),
-                                               name: .EAAccessoryDidDisconnect,
-                                               object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(accessoryDidConnect(_:)),
+            name: .EAAccessoryDidConnect,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(accessoryDidDisconnect(_:)),
+            name: .EAAccessoryDidDisconnect,
+            object: nil
+        )
 
-        post(.info, "EAManager init", meta: ["protocol": protocolString])
+        post(.info, "EAManager init")
     }
 
     deinit {
@@ -69,9 +98,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     // MARK: - CommProtocol
 
     func connectAsync(timeout: TimeInterval, peripheral _: CBPeripheral? = nil) async throws {
+        attemptId = UUID().uuidString
+        openAttempts = 0
+
         post(.info, "connectAsync start", meta: [
-            "timeout": "\(timeout)",
-            "protocol": protocolString
+            "timeout_s": String(format: "%.2f", timeout)
         ])
 
         let old = connectionState
@@ -81,17 +112,18 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
 
         let deadline = Date().addingTimeInterval(timeout)
-        openAttempts = 0
 
         while Date() < deadline {
             do {
                 openAttempts += 1
+
                 if try openSessionIfAvailable() {
                     let old2 = connectionState
                     connectionState = .connectedToAdapter
                     if old2 != connectionState {
                         DispatchQueue.main.async { self.obdDelegate?.connectionStateChanged(state: .connectedToAdapter) }
                     }
+
                     post(.info, "connectAsync success", meta: [
                         "attempts": "\(openAttempts)",
                         "accessory": accessory?.name ?? "nil"
@@ -119,7 +151,7 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         DispatchQueue.main.async { self.obdDelegate?.connectionStateChanged(state: .error) }
 
         post(.error, "connectAsync timeout", meta: [
-            "timeout": "\(timeout)",
+            "timeout_s": String(format: "%.2f", timeout),
             "attempts": "\(openAttempts)"
         ])
 
@@ -130,7 +162,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         post(.info, "disconnectPeripheral", meta: [
             "state": "\(connectionState)",
             "accessory": accessory?.name ?? "nil",
-            "lastCommand": lastCommand ?? "nil"
+            "lastCommand": lastCommand ?? "nil",
+            "inputStatus": input.map { "\($0.streamStatus.rawValue)" } ?? "nil",
+            "outputStatus": output.map { "\($0.streamStatus.rawValue)" } ?? "nil",
+            "inputErr": input?.streamError?.localizedDescription ?? "nil",
+            "outputErr": output?.streamError?.localizedDescription ?? "nil"
         ])
 
         ioQueue.sync {
@@ -160,12 +196,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     }
 
     func scanForPeripherals() async throws {
-        post(.debug, "scanForPeripherals no-op (EA)")
-        // ExternalAccessory cannot scan. No-op to match your protocol.
+        post(.debug, "scanForPeripherals no-op (ExternalAccessory)")
+        // ExternalAccessory cannot scan. No-op to match your CommProtocol.
     }
 
     func sendCommand(_ command: String, retries: Int) async throws -> [String] {
-        // Same guard spirit as BLEManager
         guard connectionState == .connectedToAdapter, output != nil else {
             post(.warning, "sendCommand blocked (not ready)", meta: [
                 "state": "\(connectionState)",
@@ -175,11 +210,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
             throw BLEManagerError.missingPeripheralOrCharacteristic
         }
 
-        // Serialize just like BLEMessageProcessor
         await commandLock.lock()
         defer { Task { await commandLock.unlock() } }
 
         lastCommand = command
+
         post(.debug, "sendCommand begin", meta: [
             "command": command,
             "retries": "\(retries)"
@@ -212,14 +247,13 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
                 if attempt < retries {
                     try await Task.sleep(nanoseconds: UInt64(BLEConstants.retryDelay * 1_000_000_000))
-                    continue
                 }
             }
         }
 
         post(.error, "sendCommand failed", meta: [
             "command": command,
-            "error": (lastError?.localizedDescription ?? "unknown")
+            "error": lastError?.localizedDescription ?? "unknown"
         ])
 
         throw lastError ?? BLEManagerError.unknownError
@@ -227,108 +261,109 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
     // MARK: - Internals
 
-   private func openSessionIfAvailable() throws -> Bool {
-    let accessories = EAAccessoryManager.shared().connectedAccessories
+    private func openSessionIfAvailable() throws -> Bool {
+        let accessories = EAAccessoryManager.shared().connectedAccessories
 
-    post(.debug, "openSessionIfAvailable", meta: [
-        "connectedAccessories": "\(accessories.count)",
-        "protocolWanted": protocolString
-    ])
-
-    // Log what iOS can currently see (key diagnostic)
-    if !accessories.isEmpty {
-        for acc in accessories {
-            post(.debug, "EA accessory seen", meta: [
-                "name": acc.name,
-                "manufacturer": acc.manufacturer,
-                "modelNumber": acc.modelNumber,
-                "serialNumber": acc.serialNumber,
-                "connectionID": "\(acc.connectionID)",
-                "protocols": acc.protocolStrings.joined(separator: ",")
-            ])
-        }
-    }
-
-    guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
-        post(.debug, "no accessory matched protocol", meta: [
-            "protocolWanted": protocolString
+        post(.debug, "openSessionIfAvailable", meta: [
+            "connectedAccessories": "\(accessories.count)"
         ])
-        return false
-    }
 
-    accessory = acc
-
-    guard let sess = EASession(accessory: acc, forProtocol: protocolString) else {
-        post(.error, "EASession returned nil", meta: [
-            "accessory": acc.name,
-            "protocol": protocolString
-        ])
-        throw BLEManagerError.unknownError
-    }
-
-    session = sess
-    input = sess.inputStream
-    output = sess.outputStream
-
-    input?.delegate = self
-    output?.delegate = self
-
-    // IMPORTANT: schedule streams on a run loop
-    input?.schedule(in: .main, forMode: .default)
-    output?.schedule(in: .main, forMode: .default)
-
-    input?.open()
-    output?.open()
-
-    // ✅ rawValue is UInt, so DO NOT use -1
-    let inputStatus = input.map { String($0.streamStatus.rawValue) } ?? "nil"
-    let outputStatus = output.map { String($0.streamStatus.rawValue) } ?? "nil"
-
-    post(.info, "EA session opened", meta: [
-        "accessory": acc.name,
-        "protocol": protocolString,
-        "inputStatus": inputStatus,
-        "outputStatus": outputStatus
-    ])
-
-    logger.info("EA session opened: \(acc.name, privacy: .public)")
-    return true
-}
-
-  private func writeCommand(_ command: String) throws {
-    guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
-    guard let data = "\(command)\r".data(using: .ascii) else { throw BLEManagerError.stringConversionFailed }
-
-    SwiftOBD2Logger.post(.debug, category: "EA", "TX \(command)")
-
-    try data.withUnsafeBytes { ptr in
-        guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else {
-            throw BLEManagerError.incorrectDataConversion
-        }
-
-        var remaining: Int = ptr.count
-        var offset: Int = 0
-
-        while remaining > 0 {
-            let written: Int = output.write(base.advanced(by: offset), maxLength: remaining)
-
-            if written <= 0 {
-                SwiftOBD2Logger.post(.error, category: "EA", "Write failed (written=\(written))", meta: [
-                    "command": command
+        // Log everything iOS sees (key diagnostic)
+        if !accessories.isEmpty {
+            for acc in accessories {
+                post(.debug, "EA accessory seen", meta: [
+                    "name": acc.name,
+                    "manufacturer": acc.manufacturer,
+                    "modelNumber": acc.modelNumber,
+                    "serialNumber": acc.serialNumber,
+                    "connectionID": "\(acc.connectionID)",
+                    "protocols": acc.protocolStrings.joined(separator: ",")
                 ])
-                throw BLEManagerError.sendMessageTimeout
+            }
+        } else {
+            post(.debug, "EAAccessoryManager connectedAccessories is empty")
+        }
+
+        guard let acc = accessories.first(where: { $0.protocolStrings.contains(protocolString) }) else {
+            post(.debug, "no accessory matched protocol", meta: [
+                "protocolWanted": protocolString
+            ])
+            return false
+        }
+
+        accessory = acc
+
+        guard let sess = EASession(accessory: acc, forProtocol: protocolString) else {
+            post(.error, "EASession returned nil", meta: [
+                "accessory": acc.name,
+                "protocol": protocolString
+            ])
+            throw BLEManagerError.unknownError
+        }
+
+        session = sess
+        input = sess.inputStream
+        output = sess.outputStream
+
+        input?.delegate = self
+        output?.delegate = self
+
+        // IMPORTANT: schedule streams on a run loop (main run loop is fine)
+        input?.schedule(in: .main, forMode: .default)
+        output?.schedule(in: .main, forMode: .default)
+
+        input?.open()
+        output?.open()
+
+        // streamStatus.rawValue is UInt -> NEVER use -1
+        let inputStatus = input.map { String($0.streamStatus.rawValue) } ?? "nil"
+        let outputStatus = output.map { String($0.streamStatus.rawValue) } ?? "nil"
+
+        post(.info, "EA session opened", meta: [
+            "accessory": acc.name,
+            "inputStatus": inputStatus,
+            "outputStatus": outputStatus
+        ])
+
+        logger.info("EA session opened: \(acc.name, privacy: .public)")
+        return true
+    }
+
+    private func writeCommand(_ command: String) throws {
+        guard let output else { throw BLEManagerError.missingPeripheralOrCharacteristic }
+        guard let data = "\(command)\r".data(using: .ascii) else { throw BLEManagerError.stringConversionFailed }
+
+        post(.debug, "TX", meta: ["command": command])
+
+        try data.withUnsafeBytes { ptr in
+            guard let base = ptr.bindMemory(to: UInt8.self).baseAddress else {
+                throw BLEManagerError.incorrectDataConversion
             }
 
-            remaining -= written
-            offset += written
+            var remaining: Int = ptr.count
+            var offset: Int = 0
+
+            while remaining > 0 {
+                let written: Int = output.write(base.advanced(by: offset), maxLength: remaining)
+                if written <= 0 {
+                    post(.error, "write failed", meta: [
+                        "command": command,
+                        "written": "\(written)",
+                        "streamErr": output.streamError?.localizedDescription ?? "nil"
+                    ])
+                    throw BLEManagerError.sendMessageTimeout
+                }
+
+                remaining -= written
+                offset += written
+            }
         }
     }
-}
 
     /// Mirrors BLEMessageProcessor.waitForResponse(timeout:)
     private func waitForResponse(timeout: TimeInterval) async throws -> [String] {
         post(.debug, "waitForResponse start", meta: [
-            "timeout": "\(timeout)",
+            "timeout_s": String(format: "%.2f", timeout),
             "lastCommand": lastCommand ?? "nil"
         ])
 
@@ -358,9 +393,7 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
                 }
             }
 
-            post(.debug, "waitForResponse done", meta: [
-                "lines": "\(lines.count)"
-            ])
+            post(.debug, "waitForResponse done", meta: ["lines": "\(lines.count)"])
             return lines
         } catch {
             post(.warning, "waitForResponse error", meta: [
@@ -374,7 +407,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     /// Mirrors BLEMessageProcessor.parseResponse(from:)
     private func parseResponse(from string: String) -> [String] {
         let cleaned = string.replacingOccurrences(of: ">", with: "")
-
         return cleaned
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -394,14 +426,10 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
 
         if let first = lines.first, first.uppercased().contains("NO DATA") {
-            post(.warning, "NO DATA", meta: [
-                "lastCommand": lastCommand ?? "nil"
-            ])
+            post(.warning, "NO DATA", meta: ["lastCommand": lastCommand ?? "nil"])
             completion(nil, BLEManagerError.noData)
         } else if lines.isEmpty {
-            post(.warning, "empty response lines", meta: [
-                "lastCommand": lastCommand ?? "nil"
-            ])
+            post(.warning, "empty response lines", meta: ["lastCommand": lastCommand ?? "nil"])
             completion(nil, BLEManagerError.noData)
         } else {
             completion(lines, nil)
@@ -415,17 +443,20 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         case .hasBytesAvailable:
             guard aStream === input else { return }
             readAvailable()
+
         case .errorOccurred:
             post(.error, "stream errorOccurred", meta: [
                 "stream": (aStream === input) ? "input" : "output",
                 "error": aStream.streamError?.localizedDescription ?? "nil"
             ])
             disconnectPeripheral()
+
         case .endEncountered:
             post(.warning, "stream endEncountered", meta: [
                 "stream": (aStream === input) ? "input" : "output"
             ])
             disconnectPeripheral()
+
         default:
             break
         }
@@ -438,11 +469,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
         while input.hasBytesAvailable {
             let n = input.read(&tmp, maxLength: tmp.count)
+
             if n > 0 {
                 ioQueue.async {
                     self.buffer.append(contentsOf: tmp[0..<n])
 
-                    // Light-weight byte logging (don’t spam full payloads)
                     self.post(.debug, "read bytes", meta: [
                         "n": "\(n)",
                         "bufferBytes": "\(self.buffer.count)"
