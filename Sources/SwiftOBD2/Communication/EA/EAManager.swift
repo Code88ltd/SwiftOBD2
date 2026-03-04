@@ -161,46 +161,54 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         throw BLEManagerError.peripheralNotFound
     }
 
-    func disconnectPeripheral() {
-        post(.info, "disconnectPeripheral", meta: [
-            "state": "\(connectionState)",
-            "accessory": accessory?.name ?? "nil",
-            "lastCommand": lastCommand ?? "nil",
-            "inputStatus": input.map { "\($0.streamStatus.rawValue)" } ?? "nil",
-            "outputStatus": output.map { "\($0.streamStatus.rawValue)" } ?? "nil",
-            "inputErr": input?.streamError?.localizedDescription ?? "nil",
-            "outputErr": output?.streamError?.localizedDescription ?? "nil"
-        ])
+  func disconnectPeripheral() {
 
-        // Ensure we tear down on main to match stream scheduling
-        DispatchQueue.main.sync {
-            self.buffer.removeAll()
+    post(.info, "disconnectPeripheral", meta: [
+        "state": "\(connectionState)",
+        "accessory": accessory?.name ?? "nil"
+    ])
 
-            let completion = self.messageCompletion
-            self.messageCompletion = nil
-            completion?(nil, BLEManagerError.peripheralNotConnected)
+    func teardown() {
 
-            self.input?.close()
-            self.output?.close()
-            self.input?.delegate = nil
-            self.output?.delegate = nil
+        buffer.removeAll()
 
-            // ✅ Remove from SAME RunLoop + mode we used to schedule
-            self.input?.remove(from: .main, forMode: .common)
-            self.output?.remove(from: .main, forMode: .common)
+        let completion = messageCompletion
+        messageCompletion = nil
+        completion?(nil, BLEManagerError.peripheralNotConnected)
 
-            self.input = nil
-            self.output = nil
-            self.session = nil
-            self.accessory = nil
-        }
+        input?.close()
+        output?.close()
 
-        let old = connectionState
-        connectionState = .disconnected
-        if old != connectionState {
-            DispatchQueue.main.async { self.obdDelegate?.connectionStateChanged(state: .disconnected) }
+        input?.delegate = nil
+        output?.delegate = nil
+
+        input?.remove(from: .main, forMode: .common)
+        output?.remove(from: .main, forMode: .common)
+
+        input = nil
+        output = nil
+        session = nil
+        accessory = nil
+    }
+
+    // ✅ NEVER block the main thread
+    if Thread.isMainThread {
+        teardown()
+    } else {
+        DispatchQueue.main.async {
+            teardown()
         }
     }
+
+    let old = connectionState
+    connectionState = .disconnected
+
+    if old != connectionState {
+        DispatchQueue.main.async {
+            self.obdDelegate?.connectionStateChanged(state: .disconnected)
+        }
+    }
+}
 
     func scanForPeripherals() async throws {
         post(.debug, "scanForPeripherals no-op (ExternalAccessory)")
