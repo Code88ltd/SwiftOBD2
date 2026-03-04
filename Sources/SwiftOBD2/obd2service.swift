@@ -2,12 +2,17 @@
 //  OBDService.swift
 //  BLE
 //
-//  UPDATED:
-//  ✅ Adds stable, app-owned error mapping (no SwiftOBD2 type names in telemetry/log messages)
-//  ✅ Special-cases “error 0” into transport.unknown_0
-//  ✅ Converts underlying errors into OBDServiceError with code/message/meta
-//  ✅ Keeps your current behavior for NO DATA (returns [])
-//  ✅ Adds optional telemetry hook (safe to leave nil)
+//  LOGGING UPGRADE (copy/paste):
+//  ✅ Adds a single, consistent telemetry logger `t(...)`
+//  ✅ Emits correlation ids: connectId + requestId
+//  ✅ Logs connection type, preferred protocol, timeout
+//  ✅ Logs lifecycle milestones + durations (adapter connect/init/vehicle setup)
+//  ✅ Logs transport selection (BLE/WiFi/EA/Demo) and blocks BLE-only actions when EA selected
+//  ✅ Logs mapped errors with stable codes (no SwiftOBD2 type names in *messages*)
+//  ✅ Adds optional “wire” logging for TX/RX (already present) + captures raw errors
+//
+//  To enable sending to Supabase:
+//  - Set `obdService.telemetrySink = { event in ... }` in your app (AppContainer / App).
 //
 
 import Combine
@@ -36,8 +41,8 @@ struct Command: Codable {
 }
 
 public class ConfigurationService {
-    static var shared = ConfigurationService()
-    var connectionType: ConnectionType {
+    public static var shared = ConfigurationService()
+    public var connectionType: ConnectionType {
         get {
             let rawValue = UserDefaults.standard.string(forKey: "connectionType") ?? ConnectionType.bluetooth.rawValue
             return ConnectionType(rawValue: rawValue) ?? .bluetooth
@@ -64,9 +69,6 @@ public actor OBDRequestLock {
 }
 
 // MARK: - Telemetry hook (optional)
-//
-// Your app can set this from the outside (AppContainer / App).
-// This avoids importing app telemetry types into the package layer.
 public struct OBDTelemetryEvent: Sendable {
     public let level: String          // "debug" | "info" | "warning" | "error"
     public let category: String       // "connection" | "communication" etc
@@ -79,11 +81,10 @@ public struct OBDTelemetryEvent: Sendable {
         self.meta = meta
     }
 }
-
 public typealias OBDTelemetrySink = @Sendable (OBDTelemetryEvent) -> Void
 
 /// A class that provides an interface to the ELM327 OBD2 adapter and the vehicle.
-public class OBDService: ObservableObject, OBDServiceDelegate {
+public final class OBDService: ObservableObject, OBDServiceDelegate {
 
     @Published public private(set) var connectionState: ConnectionState = .disconnected
     @Published public private(set) var isScanning: Bool = false
@@ -91,6 +92,10 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     @Published public var connectionType: ConnectionType {
         didSet {
+            t(.info, "connectionType changed", meta: [
+                "from": oldValue.rawValue,
+                "to": connectionType.rawValue
+            ])
             switchConnectionType(connectionType)
             ConfigurationService.shared.connectionType = connectionType
         }
@@ -105,13 +110,27 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     private var cancellables = Set<AnyCancellable>()
     private let requestLock = OBDRequestLock()
 
-    // MARK: - ✅ Logging helpers (TX/RX)
-
+    // MARK: - Correlation IDs
+    private var connectId: String = ""
     private var requestCounter: UInt64 = 0
     private func nextRequestID() -> UInt64 {
         requestCounter &+= 1
         return requestCounter
     }
+
+    // MARK: - Telemetry helper
+
+    private enum L: String { case debug, info, warning, error }
+
+    private func t(_ level: L, _ message: String, category: String = "obd", meta: [String: String]? = nil) {
+        var m = meta ?? [:]
+        if !connectId.isEmpty { m["connectId"] = connectId }
+        m["connectionType"] = connectionType.rawValue
+        m["connectionState"] = "\(connectionState)"
+        telemetrySink?(OBDTelemetryEvent(level: level.rawValue, category: category, message: message, meta: m))
+    }
+
+    // MARK: - RX/TX helpers
 
     private func formatLines(_ lines: [String]) -> String {
         lines
@@ -130,14 +149,16 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     public init(connectionType: ConnectionType = .bluetooth) {
         self.connectionType = connectionType
-
 #if targetEnvironment(simulator)
         elm327 = ELM327(comm: MOCKComm())
 #else
         elm327 = OBDService.makeELM327(for: connectionType)
 #endif
-
         elm327.obdDelegate = self
+
+        t(.info, "OBDService init", category: "lifecycle", meta: [
+            "initialConnectionType": connectionType.rawValue
+        ])
     }
 
     private static func makeELM327(for type: ConnectionType) -> ELM327 {
@@ -161,39 +182,50 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             self.connectionState = state
             if oldState != state {
                 OBDLogger.shared.logConnectionChange(from: oldState, to: state)
+                self.t(.info, "connectionState changed", category: "connection", meta: [
+                    "from": "\(oldState)",
+                    "to": "\(state)"
+                ])
             }
         }
     }
 
     /// Initiates the connection process to the OBD2 adapter and vehicle.
     public func startConnection(preferedProtocol: PROTOCOL? = nil, timeout: TimeInterval = 7) async throws -> OBDInfo {
+        connectId = UUID().uuidString
         let startTime = CFAbsoluteTimeGetCurrent()
+
+        t(.info, "startConnection begin", category: "connection", meta: [
+            "timeout_s": String(format: "%.2f", timeout),
+            "preferredProtocol": preferedProtocol.map { "\($0)" } ?? "nil"
+        ])
+
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
         postOBDLogEvent(level: "info", category: .connection, message: "Starting connection with timeout: \(timeout)s")
 
-        telemetrySink?(OBDTelemetryEvent(
-            level: "info",
-            category: "connection",
-            message: "startConnection begin",
-            meta: ["timeout": "\(timeout)", "connectionType": connectionType.rawValue]
-        ))
-
         do {
+            // 1) Connect to adapter
+            t(.debug, "connectToAdapter begin", category: "connection")
             obdDebug("Connecting to adapter...", category: .connection)
             postOBDLogEvent(level: "debug", category: .connection, message: "Connecting to adapter...")
-            telemetrySink?(OBDTelemetryEvent(level: "debug", category: "connection", message: "Connecting to adapter..."))
 
             try await elm327.connectToAdapter(timeout: timeout)
 
+            t(.debug, "connectToAdapter success", category: "connection")
+
+            // 2) Adapter init
+            t(.debug, "adapterInitialization begin", category: "connection")
             obdDebug("Initializing adapter...", category: .connection)
             postOBDLogEvent(level: "debug", category: .connection, message: "Initializing adapter...")
-            telemetrySink?(OBDTelemetryEvent(level: "debug", category: "connection", message: "Initializing adapter..."))
 
             try await elm327.adapterInitialization()
 
+            t(.debug, "adapterInitialization success", category: "connection")
+
+            // 3) Vehicle setup
+            t(.debug, "setupVehicle begin", category: "connection")
             obdDebug("Initializing vehicle connection...", category: .connection)
             postOBDLogEvent(level: "debug", category: .connection, message: "Initializing vehicle connection...")
-            telemetrySink?(OBDTelemetryEvent(level: "debug", category: "connection", message: "Initializing vehicle connection..."))
 
             let vehicleInfo = try await initializeVehicle(preferedProtocol)
 
@@ -201,15 +233,13 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             OBDLogger.shared.logPerformance("Connection established", duration: duration, success: true)
 
             let vin = vehicleInfo.vin ?? "Unknown"
+            t(.info, "startConnection success", category: "connection", meta: [
+                "vin": vin,
+                "durationMs": "\(Int(duration * 1000))"
+            ])
+
             obdInfo("Successfully connected to vehicle: \(vin)", category: .connection)
             postOBDLogEvent(level: "info", category: .connection, message: "Successfully connected to vehicle: \(vin)")
-
-            telemetrySink?(OBDTelemetryEvent(
-                level: "info",
-                category: "connection",
-                message: "Connected",
-                meta: ["vin": vin, "durationMs": "\(Int(duration * 1000))", "connectionType": connectionType.rawValue]
-            ))
 
             return vehicleInfo
         } catch {
@@ -218,17 +248,13 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
             let mapped = mapUnderlyingError(error)
 
-            // IMPORTANT: keep app logs clean (no SwiftOBD2 type names)
             let cleanMessage = "Connection failed (\(mapped.code)): \(mapped.message)"
+            t(.error, cleanMessage, category: "connection", meta: mapped.meta.merging([
+                "durationMs": "\(Int(duration * 1000))"
+            ]) { $1 })
+
             obdError(cleanMessage, category: .connection)
             postOBDLogEvent(level: "error", category: .connection, message: cleanMessage)
-
-            telemetrySink?(OBDTelemetryEvent(
-                level: "error",
-                category: "connection",
-                message: cleanMessage,
-                meta: mapped.meta.merging(["durationMs": "\(Int(duration * 1000))", "connectionType": connectionType.rawValue]) { $1 }
-            ))
 
             throw OBDServiceError.adapterConnectionFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
         }
@@ -241,11 +267,15 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     /// Terminates the connection with the OBD2 adapter.
     public func stopConnection() {
+        t(.info, "stopConnection", category: "connection")
         elm327.stopConnection()
     }
 
     /// Switches the active connection type.
     private func switchConnectionType(_ connectionType: ConnectionType) {
+        t(.info, "switchConnectionType", category: "connection", meta: [
+            "to": connectionType.rawValue
+        ])
         stopConnection()
         initializeELM327()
     }
@@ -257,6 +287,19 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         elm327 = OBDService.makeELM327(for: connectionType)
 #endif
         elm327.obdDelegate = self
+
+        t(.info, "initializeELM327 complete", category: "lifecycle", meta: [
+            "transport": transportLabel(for: connectionType)
+        ])
+    }
+
+    private func transportLabel(for type: ConnectionType) -> String {
+        switch type {
+        case .bluetooth: return "ble"
+        case .wifi: return "wifi"
+        case .externalAccessory: return "ea"
+        case .demo: return "demo"
+        }
     }
 
     // MARK: - Request Handling
@@ -268,6 +311,11 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
         unit: MeasurementUnit = .metric,
         interval: TimeInterval = 0.3
     ) -> AnyPublisher<[OBDCommand: MeasurementResult], Error> {
+
+        t(.info, "startContinuousUpdates", category: "stream", meta: [
+            "pidCount": "\(pids.count)",
+            "interval_s": String(format: "%.2f", interval)
+        ])
 
         return Timer.publish(every: interval, on: .main, in: .common)
             .autoconnect()
@@ -297,26 +345,24 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     /// ✅ Batched Mode01 requests. Serialized behind requestLock.
     public func requestPIDs(_ commands: [OBDCommand], unit: MeasurementUnit) async throws -> [OBDCommand: MeasurementResult] {
         try await requestLock.withLock {
-
             let pidListString = commands.map { $0.properties.command }.joined(separator: ", ")
-            let batchMsg = "Batch request: [\(pidListString)]"
-            obdDebug(batchMsg, category: .communication)
-            postOBDLogEvent(level: "debug", category: .communication, message: batchMsg)
+
+            t(.debug, "requestPIDs batch begin", category: "communication", meta: [
+                "pids": pidListString
+            ])
 
             let message = "01" + commands.compactMap { $0.properties.command.dropFirst(2) }.joined()
             let response = try await sendCommandInternal(message, retries: 10)
 
             guard let frame = try elm327.canProtocol?.parse(response).first else {
-                let warn = "Batch parse produced no frames for [\(pidListString)]"
-                obdWarning(warn, category: .communication)
-                postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                let warn = "Batch parse produced no frames"
+                t(.warning, warn, category: "communication", meta: ["pids": pidListString])
                 return [:]
             }
 
             guard let data = frame.data else {
-                let warn = "Parsed frame had nil data for [\(pidListString)] :: \(frame)"
-                obdWarning(warn, category: .communication)
-                postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                let warn = "Parsed frame had nil data"
+                t(.warning, warn, category: "communication", meta: ["pids": pidListString])
                 return [:]
             }
 
@@ -326,9 +372,9 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 if let measurement = batchedResponse.extractValue(command) {
                     result[command] = measurement
                 } else {
-                    let warn = "NO DATA / decode miss in batch for PID \(command.properties.command)"
-                    obdWarning(warn, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                    t(.warning, "decode miss / NO DATA in batch", category: "communication", meta: [
+                        "pid": command.properties.command
+                    ])
                 }
             }
 
@@ -342,21 +388,22 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             do {
                 let response = try await sendCommandInternal(command.properties.command, retries: 3)
                 guard let responseData = try elm327.canProtocol?.parse(response).first?.data else {
-                    let warn = "Parse NO DATA for \(command.properties.command)"
-                    obdWarning(warn, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                    t(.warning, "parse NO DATA", category: "communication", meta: ["pid": command.properties.command])
                     return .failure(.noData)
                 }
 
                 let decoded = command.properties.decode(data: responseData.dropFirst())
-                if case .failure(let err) = decoded {
-                    let warn = "Decode failed for \(command.properties.command): \(err)"
-                    obdWarning(warn, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: warn)
+                if case .failure = decoded {
+                    t(.warning, "decode failed", category: "communication", meta: ["pid": command.properties.command])
                 }
                 return decoded
             } catch {
                 let mapped = mapUnderlyingError(error)
+                t(.error, "sendCommand failed", category: "communication", meta: mapped.meta.merging([
+                    "pid": command.properties.command,
+                    "code": mapped.code,
+                    "message": mapped.message
+                ]) { $1 })
                 throw OBDServiceError.commandFailed(command: command.properties.command, code: mapped.code, message: mapped.message, meta: mapped.meta)
             }
         }
@@ -375,6 +422,10 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 return try await elm327.scanForTroubleCodes()
             } catch {
                 let mapped = mapUnderlyingError(error)
+                t(.error, "scanForTroubleCodes failed", category: "dtc", meta: mapped.meta.merging([
+                    "code": mapped.code,
+                    "message": mapped.message
+                ]) { $1 })
                 throw OBDServiceError.scanFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
             }
         }
@@ -386,6 +437,10 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 try await elm327.clearTroubleCodes()
             } catch {
                 let mapped = mapUnderlyingError(error)
+                t(.error, "clearTroubleCodes failed", category: "dtc", meta: mapped.meta.merging([
+                    "code": mapped.code,
+                    "message": mapped.message
+                ]) { $1 })
                 throw OBDServiceError.clearFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
             }
         }
@@ -414,13 +469,18 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             let noV = cleaned.replacingOccurrences(of: "V", with: "", options: [.caseInsensitive])
-
             let token = noV
                 .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
                 .first(where: { !$0.isEmpty })
 
             guard let token, let value = Double(token) else {
-                throw OBDServiceError.commandFailed(command: "ATRV", code: "elm.invalid_response", message: "Invalid ATRV response", meta: ["raw": joined])
+                t(.error, "ATRV invalid response", category: "communication", meta: ["raw": joined])
+                throw OBDServiceError.commandFailed(
+                    command: "ATRV",
+                    code: "elm.invalid_response",
+                    message: "Invalid ATRV response",
+                    meta: ["raw": joined]
+                )
             }
 
             return MeasurementResult(value: value, unit: UnitElectricPotentialDifference.volts)
@@ -428,14 +488,15 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
     }
 
     /// Sends a raw command to the vehicle and returns the raw response.
-    /// NOTE: This is called inside requestLock wrappers above.
     public func sendCommandInternal(_ message: String, retries: Int) async throws -> [String] {
-        let id = nextRequestID()
+        let rid = nextRequestID()
         let start = CFAbsoluteTimeGetCurrent()
 
-        let tx = "TX [#\(id)] → \(message) (retries=\(retries))"
-        obdDebug(tx, category: .communication)
-        postOBDLogEvent(level: "debug", category: .communication, message: tx)
+        t(.debug, "TX", category: "wire", meta: [
+            "requestId": "\(rid)",
+            "command": message,
+            "retries": "\(retries)"
+        ])
 
         do {
             let lines = try await elm327.sendCommand(message, retries: retries)
@@ -443,37 +504,43 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
             let formatted = formatLines(lines)
 
             if isLikelyNoData(lines) {
-                let msg = "RX [#\(id)] ← NO DATA (\(ms)ms) :: \(formatted)"
-                obdWarning(msg, category: .communication)
-                postOBDLogEvent(level: "warning", category: .communication, message: msg)
+                t(.warning, "RX NO DATA", category: "wire", meta: [
+                    "requestId": "\(rid)",
+                    "ms": "\(ms)",
+                    "command": message,
+                    "rx": formatted
+                ])
             } else {
-                let msg = "RX [#\(id)] ← (\(ms)ms) :: \(formatted)"
-                obdDebug(msg, category: .communication)
-                postOBDLogEvent(level: "debug", category: .communication, message: msg)
+                t(.debug, "RX", category: "wire", meta: [
+                    "requestId": "\(rid)",
+                    "ms": "\(ms)",
+                    "command": message,
+                    "rx": formatted
+                ])
             }
 
             return lines
         } catch {
             let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
 
-            // Treat "NO DATA" as non-fatal for unsupported PIDs
-            if let ble = error as? BLEManagerError {
-                switch ble {
-                case .noData:
-                    let msg = "ERR [#\(id)] \(message) (\(ms)ms) :: NO DATA"
-                    obdWarning(msg, category: .communication)
-                    postOBDLogEvent(level: "warning", category: .communication, message: msg)
-                    return []
-                default:
-                    break
-                }
+            // Keep NO DATA behavior
+            if let ble = error as? BLEManagerError, ble == .noData {
+                t(.warning, "ERR NO DATA", category: "wire", meta: [
+                    "requestId": "\(rid)",
+                    "ms": "\(ms)",
+                    "command": message
+                ])
+                return []
             }
 
             let mapped = mapUnderlyingError(error)
-
-            let msg = "ERR [#\(id)] \(message) (\(ms)ms) :: (\(mapped.code)) \(mapped.message)"
-            obdError(msg, category: .communication)
-            postOBDLogEvent(level: "error", category: .communication, message: msg)
+            t(.error, "ERR", category: "wire", meta: mapped.meta.merging([
+                "requestId": "\(rid)",
+                "ms": "\(ms)",
+                "command": message,
+                "code": mapped.code,
+                "message": mapped.message
+            ]) { $1 })
 
             throw OBDServiceError.commandFailed(command: message, code: mapped.code, message: mapped.message, meta: mapped.meta)
         }
@@ -483,27 +550,48 @@ public class OBDService: ObservableObject, OBDServiceDelegate {
 
     public func connectToPeripheral(peripheral: CBPeripheral) async throws {
         guard connectionType == .bluetooth else {
+            t(.warning, "connectToPeripheral blocked (not BLE mode)", category: "ble", meta: [
+                "selected": connectionType.rawValue
+            ])
             throw OBDServiceError.operationNotSupportedForConnectionType(connectionType)
         }
         do {
+            t(.info, "connectToPeripheral begin", category: "ble", meta: [
+                "name": peripheral.name ?? "nil",
+                "identifier": peripheral.identifier.uuidString
+            ])
             try await elm327.connectToAdapter(timeout: 5, peripheral: peripheral)
+            t(.info, "connectToPeripheral success", category: "ble")
         } catch {
             let mapped = mapUnderlyingError(error)
+            t(.error, "connectToPeripheral failed", category: "ble", meta: mapped.meta.merging([
+                "code": mapped.code,
+                "message": mapped.message
+            ]) { $1 })
             throw OBDServiceError.adapterConnectionFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
         }
     }
 
     public func scanForPeripherals() async throws {
         guard connectionType == .bluetooth else {
+            t(.warning, "scanForPeripherals blocked (not BLE mode)", category: "ble", meta: [
+                "selected": connectionType.rawValue
+            ])
             throw OBDServiceError.operationNotSupportedForConnectionType(connectionType)
         }
         do {
-            self.isScanning = true
+            isScanning = true
+            t(.info, "scanForPeripherals begin", category: "ble")
             try await elm327.scanForPeripherals()
-            self.isScanning = false
+            isScanning = false
+            t(.info, "scanForPeripherals end", category: "ble")
         } catch {
-            self.isScanning = false
+            isScanning = false
             let mapped = mapUnderlyingError(error)
+            t(.error, "scanForPeripherals failed", category: "ble", meta: mapped.meta.merging([
+                "code": mapped.code,
+                "message": mapped.message
+            ]) { $1 })
             throw OBDServiceError.scanFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
         }
     }
@@ -527,19 +615,18 @@ private extension OBDService {
             "nsDescription": ns.localizedDescription
         ]
 
-        // Best-effort “type” without leaking module names into telemetry messages.
+        // Keep type info in meta (OK), but DO NOT put it in user-facing message.
         meta["type"] = String(reflecting: type(of: error))
 
-        // ✅ Special-case: "error 0"
+        // Special-case: "error 0"
         if ns.code == 0 {
             return MappedError(
                 code: "transport.unknown_0",
-                message: "Transport failed with unknown error (code 0). Likely stale OS/Bluetooth/EA state.",
+                message: "Transport failed with unknown error (code 0).",
                 meta: meta
             )
         }
 
-        // ✅ Common BLE errors -> stable codes (message does NOT include SwiftOBD2 types)
         if let ble = error as? BLEManagerError {
             meta["bleCase"] = String(describing: ble)
             switch ble {
@@ -556,18 +643,16 @@ private extension OBDService {
             }
         }
 
-        // ✅ ELM errors
         if let elm = error as? ELM327Error {
             meta["elmCase"] = String(describing: elm)
             return MappedError(code: "elm.error", message: "Adapter returned an invalid/failed response.", meta: meta)
         }
 
-        // Default fallback
         return MappedError(code: "unknown", message: ns.localizedDescription, meta: meta)
     }
 }
 
-// MARK: - Errors (updated: stable code/message/meta)
+// MARK: - Errors (stable code/message/meta)
 
 public enum OBDServiceError: Error {
     case noAdapterFound
@@ -579,16 +664,6 @@ public enum OBDServiceError: Error {
     case commandFailed(command: String, code: String, message: String, meta: [String: String])
 
     case operationNotSupportedForConnectionType(ConnectionType)
-
-    // Back-compat initializer if you still throw the old case in some call sites
-    public static func adapterConnectionFailed(underlyingError: Error) -> OBDServiceError {
-        let ns = underlyingError as NSError
-        return .adapterConnectionFailed(
-            code: ns.code == 0 ? "transport.unknown_0" : "unknown",
-            message: ns.localizedDescription,
-            meta: ["nsDomain": ns.domain, "nsCode": "\(ns.code)", "nsDescription": ns.localizedDescription]
-        )
-    }
 }
 
 // MARK: - MeasurementResult
@@ -609,7 +684,7 @@ public extension MeasurementResult {
     }
 }
 
-// MARK: - VIN Helper (unchanged)
+// MARK: - VIN Helper
 
 public func getVINInfo(vin: String) async throws -> VINResults {
     let endpoint = "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/\(vin)?format=json"
