@@ -666,6 +666,35 @@ public enum OBDServiceError: Error {
     case operationNotSupportedForConnectionType(ConnectionType)
 }
 
+extension OBDServiceError: LocalizedError {
+
+    public var errorDescription: String? {
+        switch self {
+
+        case .noAdapterFound:
+            return "No OBD adapter was found."
+
+        case .notConnectedToVehicle:
+            return "Not connected to the vehicle."
+
+        case .adapterConnectionFailed(_, let message, _):
+            return message
+
+        case .scanFailed(_, let message, _):
+            return message
+
+        case .clearFailed(_, let message, _):
+            return message
+
+        case .commandFailed(_, let message, _):
+            return message
+
+        case .operationNotSupportedForConnectionType(let type):
+            return "Operation not supported when using \(type.rawValue)."
+        }
+    }
+}
+
 // MARK: - MeasurementResult
 
 public struct MeasurementResult: Equatable {
