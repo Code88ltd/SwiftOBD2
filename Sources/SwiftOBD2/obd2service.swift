@@ -686,7 +686,7 @@ extension OBDServiceError: LocalizedError {
         case .clearFailed(_, let message, _):
             return message
 
-        case .commandFailed(_, let message, _):
+        case .commandFailed(_, _, let message, _):
             return message
 
         case .operationNotSupportedForConnectionType(let type):
