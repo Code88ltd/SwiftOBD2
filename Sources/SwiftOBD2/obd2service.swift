@@ -596,27 +596,6 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
         }
     }
 
-        // MARK: - VIN
-
-
-
-    public func requestVIN(retries: Int = 2) async throws -> String? {
-        try await requestLock.withLock {
-            guard connectionState != .disconnected else {
-                throw OBDServiceError.notConnectedToVehicle
-            }
-
-            let lines = try await sendCommandInternal("0902", retries: retries)
-            let vin = Self.parseVIN(from: lines)
-
-            t(.info, "requestVIN result", category: "vin", meta: [
-                "vin": vin ?? "nil",
-                "rawLineCount": "\(lines.count)"
-            ])
-
-            return vin
-        }
-    }
 
     // MARK: - VIN
 
