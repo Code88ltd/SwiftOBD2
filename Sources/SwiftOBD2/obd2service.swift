@@ -595,6 +595,135 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
             throw OBDServiceError.scanFailed(code: mapped.code, message: mapped.message, meta: mapped.meta)
         }
     }
+
+        // MARK: - VIN
+
+
+
+    public func requestVIN(retries: Int = 2) async throws -> String? {
+        try await requestLock.withLock {
+            guard connectionState != .disconnected else {
+                throw OBDServiceError.notConnectedToVehicle
+            }
+
+            let lines = try await sendCommandInternal("0902", retries: retries)
+            let vin = Self.parseVIN(from: lines)
+
+            t(.info, "requestVIN result", category: "vin", meta: [
+                "vin": vin ?? "nil",
+                "rawLineCount": "\(lines.count)"
+            ])
+
+            return vin
+        }
+    }
+
+    // MARK: - VIN
+
+public func requestVIN(retries: Int = 2) async throws -> String? {
+    try await requestLock.withLock {
+        guard connectionState != .disconnected else {
+            throw OBDServiceError.notConnectedToVehicle
+        }
+
+        var lastLines: [String] = []
+
+        for attempt in 0...retries {
+            let lines = try await sendCommandInternal("0902", retries: 0)
+            lastLines = lines
+
+            if let vin = Self.parseVIN(from: lines) {
+                t(.info, "requestVIN success", category: "vin", meta: [
+                    "attempt": "\(attempt + 1)",
+                    "vin": vin,
+                    "rawLineCount": "\(lines.count)"
+                ])
+                return vin
+            }
+
+            t(.warning, "requestVIN parse failed", category: "vin", meta: [
+                "attempt": "\(attempt + 1)",
+                "rawLineCount": "\(lines.count)",
+                "raw": lines.joined(separator: " | ")
+            ])
+
+            if attempt < retries {
+                try? await Task.sleep(nanoseconds: 350_000_000)
+            }
+        }
+
+        t(.info, "requestVIN result", category: "vin", meta: [
+            "vin": "nil",
+            "rawLineCount": "\(lastLines.count)",
+            "raw": lastLines.joined(separator: " | ")
+        ])
+
+        return nil
+    }
+}
+
+private static func parseVIN(from lines: [String]) -> String? {
+    let cleanedLines = lines
+        .map { $0.replacingOccurrences(of: "\0", with: "") }
+        .map { $0.replacingOccurrences(of: ">", with: "") }
+        .map { $0.replacingOccurrences(of: ":", with: " ") }
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+    var collected: [UInt8] = []
+
+    for line in cleanedLines {
+        let tokens = line
+            .split(whereSeparator: { $0 == " " || $0 == "\t" })
+            .map(String.init)
+
+        let bytes = tokens.compactMap { UInt8($0, radix: 16) }
+        guard !bytes.isEmpty else { continue }
+
+        guard let start = bytes.firstIndex(of: 0x49),
+              start + 1 < bytes.count,
+              bytes[start + 1] == 0x02 else {
+            continue
+        }
+
+        // Common VIN response format:
+        // 49 02 01 xx xx xx ...
+        // Skip 49 02 and the frame index byte.
+        let payloadStart = start + 3
+        guard payloadStart < bytes.count else { continue }
+
+        collected.append(contentsOf: bytes[payloadStart...])
+    }
+
+    guard !collected.isEmpty else { return nil }
+
+    // Build a clean VIN-like string from printable alphanumerics only.
+    let vinChars: [Character] = collected.compactMap { byte in
+        guard let scalar = UnicodeScalar(Int(byte)) else { return nil }
+        let ch = Character(scalar)
+        return ch.isLetter || ch.isNumber ? Character(String(ch).uppercased()) : nil
+    }
+
+    guard !vinChars.isEmpty else { return nil }
+
+    var vin = String(vinChars)
+
+    // Some adapters duplicate or over-return data; trim to first 17 chars.
+    if vin.count > 17 {
+        vin = String(vin.prefix(17))
+    }
+
+    guard vin.count == 17 else { return nil }
+    guard vin != "UNKNOWN" else { return nil }
+
+    // Real VINs do not use I, O, or Q.
+    guard !vin.contains("I"),
+          !vin.contains("O"),
+          !vin.contains("Q") else {
+        return nil
+    }
+
+    return vin
 }
 
 // MARK: - Error mapping (NO SwiftOBD2 leakage)
