@@ -704,6 +704,7 @@ private static func parseVIN(from lines: [String]) -> String? {
 
     return vin
 }
+}
 
 // MARK: - Error mapping (NO SwiftOBD2 leakage)
 
