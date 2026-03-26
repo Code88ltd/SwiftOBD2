@@ -6,13 +6,9 @@ import OSLog
 
 final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
-    // MARK: - CommProtocol
-
     @Published var connectionState: ConnectionState = .disconnected
     var connectionStatePublisher: Published<ConnectionState>.Publisher { $connectionState }
     weak var obdDelegate: OBDServiceDelegate?
-
-    // MARK: - Config
 
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.swiftobd2.app",
@@ -20,8 +16,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     )
 
     private let protocolString = "com.obdlink"
-
-    // MARK: - Logging bridge
 
     private let logCategory = "EA"
 
@@ -40,31 +34,18 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         SwiftOBD2Logger.post(level, category: logCategory, message, meta: m)
     }
 
-    // MARK: - Serial state queue
-
     private let stateQueue = DispatchQueue(label: "swiftobd2.ea.state")
-
-    // MARK: - EA session
 
     private var accessory: EAAccessory?
     private var session: EASession?
     private var input: InputStream?
     private var output: OutputStream?
 
-    // MARK: - Response handling
-
     private var buffer = Data()
     private var messageCompletion: (([String]?, Error?) -> Void)?
 
-    // MARK: - Command serialization
-
     private let commandLock = AsyncLock()
-
-    // MARK: - Disconnect guard
-
     private var isDisconnecting = false
-
-    // MARK: - Lifecycle
 
     override init() {
         super.init()
@@ -91,10 +72,10 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     deinit {
         NotificationCenter.default.removeObserver(self)
         EAAccessoryManager.shared().unregisterForLocalNotifications()
-        disconnectPeripheral()
-    }
 
-    // MARK: - CommProtocol
+        // IMPORTANT: do not async back onto stateQueue during deinit
+        performDisconnectCleanup(notifyDelegate: false)
+    }
 
     func connectAsync(timeout: TimeInterval, peripheral _: CBPeripheral? = nil) async throws {
         attemptId = UUID().uuidString
@@ -135,53 +116,55 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
     }
 
     func disconnectPeripheral() {
-        stateQueue.async {
-            guard !self.isDisconnecting else { return }
-            self.isDisconnecting = true
+        stateQueue.sync {
+            self.performDisconnectCleanup(notifyDelegate: true)
+        }
+    }
 
-            self.post(.info, "disconnectPeripheral", meta: [
-                "state": "\(self.connectionState)",
-                "accessory": self.accessory?.name ?? "nil"
-            ])
+    private func performDisconnectCleanup(notifyDelegate: Bool) {
+        guard !isDisconnecting else { return }
+        isDisconnecting = true
+        defer { isDisconnecting = false }
 
-            self.buffer.removeAll()
+        post(.info, "disconnectPeripheral", meta: [
+            "state": "\(connectionState)",
+            "accessory": accessory?.name ?? "nil"
+        ])
 
-            let completion = self.messageCompletion
-            self.messageCompletion = nil
+        buffer.removeAll()
 
-            self.input?.delegate = nil
-            self.output?.delegate = nil
+        let completion = messageCompletion
+        messageCompletion = nil
 
-            self.input?.close()
-            self.output?.close()
+        input?.delegate = nil
+        output?.delegate = nil
 
-            self.input?.remove(from: .main, forMode: .common)
-            self.output?.remove(from: .main, forMode: .common)
+        input?.close()
+        output?.close()
 
-            self.input = nil
-            self.output = nil
-            self.session = nil
-            self.accessory = nil
-            self.lastCommand = nil
+        input?.remove(from: .main, forMode: .common)
+        output?.remove(from: .main, forMode: .common)
 
-            completion?(nil, BLEManagerError.peripheralNotConnected)
+        input = nil
+        output = nil
+        session = nil
+        accessory = nil
+        lastCommand = nil
 
-            let old = self.connectionState
-            self.connectionState = .disconnected
+        completion?(nil, BLEManagerError.peripheralNotConnected)
 
-            if old != .disconnected {
-                DispatchQueue.main.async {
-                    self.obdDelegate?.connectionStateChanged(state: .disconnected)
-                }
+        let old = connectionState
+        connectionState = .disconnected
+
+        if notifyDelegate, old != .disconnected {
+            DispatchQueue.main.async { [weak self] in
+                self?.obdDelegate?.connectionStateChanged(state: .disconnected)
             }
-
-            self.isDisconnecting = false
         }
     }
 
     func scanForPeripherals() async throws {
         post(.debug, "scanForPeripherals no-op (ExternalAccessory)")
-        // ExternalAccessory cannot actively scan. No-op.
     }
 
     func sendCommand(_ command: String, retries: Int) async throws -> [String] {
@@ -241,8 +224,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         throw lastError ?? BLEManagerError.unknownError
     }
 
-    // MARK: - Open session
-
     private func openSessionIfAvailable() throws -> Bool {
         let accessories = EAAccessoryManager.shared().connectedAccessories
 
@@ -278,8 +259,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         logger.info("EA session opened: \(acc.name, privacy: .public)")
         return true
     }
-
-    // MARK: - Write
 
     private func writeCommand(_ command: String) throws {
         guard let output else {
@@ -322,8 +301,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
     }
 
-    // MARK: - Wait for response
-
     private func waitForResponse(timeout: TimeInterval) async throws -> [String] {
         try await withTimeout(seconds: timeout, timeoutError: BLEManagerError.timeout) {
             try await withCheckedThrowingContinuation { continuation in
@@ -351,8 +328,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
     }
 
-    // MARK: - StreamDelegate
-
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
         switch eventCode {
         case .hasBytesAvailable:
@@ -378,8 +353,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
         }
     }
 
-    // MARK: - Read
-
     private func readAvailable() {
         guard let input else { return }
 
@@ -387,7 +360,6 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
 
         while input.hasBytesAvailable {
             let n = input.read(&tmp, maxLength: tmp.count)
-
             if n <= 0 { break }
 
             self.stateQueue.async {
@@ -409,14 +381,11 @@ final class EAManager: NSObject, CommProtocol, StreamDelegate {
                     self.messageCompletion = nil
 
                     completion?(lines, nil)
-
                     self.buffer.removeAll()
                 }
             }
         }
     }
-
-    // MARK: - Accessory notifications
 
     @objc private func accessoryDidConnect(_ note: Notification) {
         guard let acc = note.userInfo?[EAAccessoryKey] as? EAAccessory else { return }
