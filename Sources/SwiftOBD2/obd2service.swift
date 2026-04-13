@@ -174,16 +174,7 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
         }
     }
 
-    //DemoVin
-
-    private func makeDemoOBDInfo() -> OBDInfo {
-    OBDInfo(
-        vin: "WAULT58E22A309402",
-        make: "Audi",
-        model: "A4",
-        modelYear: "2005"
-    )
-}
+    
     
     // MARK: - Connection Handling
 
@@ -211,22 +202,7 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
             "preferredProtocol": preferedProtocol.map { "\($0)" } ?? "nil"
         ])
         
-    if connectionType == .demo {
-        let demoInfo = makeDemoOBDInfo()
-
-        DispatchQueue.main.async {
-            self.connectionState = .connected
-        }
-
-        t(.info, "startConnection demo success", category: "connection", meta: [
-            "vin": demoInfo.vin ?? "nil",
-            "make": demoInfo.make ?? "nil",
-            "model": demoInfo.model ?? "nil",
-            "year": demoInfo.modelYear ?? "nil"
-        ])
-
-        return demoInfo
-    }
+  
 
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
         postOBDLogEvent(level: "info", category: .connection, message: "Starting connection with timeout: \(timeout)s")
