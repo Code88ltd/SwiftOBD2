@@ -26,11 +26,6 @@ public enum ConnectionType: String, CaseIterable {
     case demo = "Demo"
 }
 
-private static let demoVIN = "WAULT58E22A309402"
-
-private func makeDemoOBDInfo() -> OBDInfo {
-    OBDInfo(vin: Self.demoVIN)
-}
 
 public protocol OBDServiceDelegate: AnyObject {
     func connectionStateChanged(state: ConnectionState)
@@ -115,6 +110,13 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
 
     private var cancellables = Set<AnyCancellable>()
     private let requestLock = OBDRequestLock()
+
+    private static let demoVIN = "WAULT58E22A309402"
+
+private func makeDemoOBDInfo() -> OBDInfo {
+    OBDInfo(vin: Self.demoVIN)
+}
+
 
     // MARK: - Correlation IDs
     private var connectId: String = ""
