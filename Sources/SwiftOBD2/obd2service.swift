@@ -26,6 +26,12 @@ public enum ConnectionType: String, CaseIterable {
     case demo = "Demo"
 }
 
+private static let demoVIN = "WAULT58E22A309402"
+
+private func makeDemoOBDInfo() -> OBDInfo {
+    OBDInfo(vin: Self.demoVIN)
+}
+
 public protocol OBDServiceDelegate: AnyObject {
     func connectionStateChanged(state: ConnectionState)
 }
@@ -202,7 +208,19 @@ public final class OBDService: ObservableObject, OBDServiceDelegate {
             "preferredProtocol": preferedProtocol.map { "\($0)" } ?? "nil"
         ])
         
-  
+  if connectionType == .demo {
+    let demoInfo = makeDemoOBDInfo()
+
+    DispatchQueue.main.async {
+        self.connectionState = .connectedToVehicle
+    }
+
+    t(.info, "startConnection demo success", category: "connection", meta: [
+        "vin": demoInfo.vin ?? "nil"
+    ])
+
+    return demoInfo
+}
 
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
         postOBDLogEvent(level: "info", category: .connection, message: "Starting connection with timeout: \(timeout)s")
