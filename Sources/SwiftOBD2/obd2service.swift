@@ -210,18 +210,27 @@ private func makeDemoOBDInfo() -> OBDInfo {
             "preferredProtocol": preferedProtocol.map { "\($0)" } ?? "nil"
         ])
         
-  if connectionType == .demo {
-    let demoInfo = makeDemoOBDInfo()
+ if connectionType == .demo {
+    t(.info, "startConnection demo begin", category: "connection")
+
+    try await elm327.connectToAdapter(timeout: timeout)
+    try await elm327.adapterInitialization()
+
+    var vehicleInfo = try await initializeVehicle(preferedProtocol)
+
+    if vehicleInfo.vin == nil || vehicleInfo.vin?.isEmpty == true {
+        vehicleInfo = makeDemoOBDInfo()
+    }
 
     DispatchQueue.main.async {
         self.connectionState = .connectedToVehicle
     }
 
     t(.info, "startConnection demo success", category: "connection", meta: [
-        "vin": demoInfo.vin ?? "nil"
+        "vin": vehicleInfo.vin ?? "nil"
     ])
 
-    return demoInfo
+    return vehicleInfo
 }
 
         obdInfo("Starting connection with timeout: \(timeout)s", category: .connection)
