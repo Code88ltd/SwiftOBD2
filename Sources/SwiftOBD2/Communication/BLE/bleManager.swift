@@ -320,24 +320,24 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
     /// Sends a message to the connected peripheral and returns the response.
     /// - Parameter message: The message to send.
     /// - Returns: The response from the peripheral.
-    func sendCommand(_ command: String, retries _: Int = 3) async throws -> [String] {
-        guard let peripheral = peripheralManager.connectedPeripheral else {
-            obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
-            throw BLEManagerError.missingPeripheralOrCharacteristic
-        }
-
-        obdDebug("Sending command: \(command)", category: .communication)
-
-        do {
-            try characteristicHandler.writeCommand(command, to: peripheral)
-            let response = try await messageProcessor.waitForResponse(timeout: BLEConstants.defaultTimeout)
-            obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
-            return response
-        } catch {
-            obdError("Command failed: \(command) - \(error.localizedDescription)", category: .communication)
-            throw error
-        }
+ func sendCommand(_ command: String, retries _: Int = 3) async throws -> [String] {
+    guard let peripheral = peripheralManager.connectedPeripheral else {
+        obdError("Missing peripheral or ECU characteristic", category: .bluetooth)
+        throw BLEManagerError.missingPeripheralOrCharacteristic
     }
+
+    obdDebug("Sending command: \(command)", category: .communication)
+
+    do {
+        try await characteristicHandler.writeCommand(command, to: peripheral)
+        let response = try await messageProcessor.waitForResponse(timeout: BLEConstants.defaultTimeout)
+        obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
+        return response
+    } catch {
+        obdError("Command failed: \(command) - \(error.localizedDescription)", category: .communication)
+        throw error
+    }
+}
 
     func scanForPeripherals() async throws {
         startScanning(nil)
