@@ -34,11 +34,15 @@ final class MockVehicleSim {
     private var throttle: Double = 0.12
     private var targetThrottle: Double = 0.12
 
+    // Sweep directions
+    private var coolantRising = true
+    private var intakeRising = true
+
     // State
     private(set) var rpm: Double = 850
     private(set) var speedKph: Double = 0
-    private(set) var coolantC: Double = 25
-    private(set) var intakeC: Double = 18
+    private(set) var coolantC: Double = 50
+    private(set) var intakeC: Double = 20
     private(set) var loadPct: Double = 18
     private(set) var maf: Double = 3.0
     private(set) var voltage: Double = 12.4
@@ -52,10 +56,12 @@ final class MockVehicleSim {
 
         // Occasionally change throttle target (simulate human)
         if Double.random(in: 0...1) < 0.05 {
-            // bias towards mild driving, with occasional larger pulls
             let pick = Double.random(in: 0...1)
-            if pick < 0.75 { targetThrottle = Double.random(in: 0.12...0.45) }
-            else { targetThrottle = Double.random(in: 0.45...0.85) }
+            if pick < 0.75 {
+                targetThrottle = Double.random(in: 0.12...0.45)
+            } else {
+                targetThrottle = Double.random(in: 0.45...0.85)
+            }
         }
 
         // Smooth throttle
@@ -75,16 +81,44 @@ final class MockVehicleSim {
         let targetLoad = clamp(15 + throttle * 75 + speedKph * 0.06, 5, 100)
         loadPct = approach(loadPct, targetLoad, rate: 3.0, dt: dt)
 
-        // Coolant warms slowly towards ~90–100 depending on load
-        let coolantTarget = 92 + (loadPct - 20) * 0.05
-        let warmRate = coolantC < 80 ? 0.18 : 0.07
-        coolantC = clamp(approach(coolantC, coolantTarget, rate: warmRate, dt: dt), 10, 115)
+        // Coolant sweep: 50 -> 120 -> 50
+        let coolantRate = 6.0
+        if coolantRising {
+            coolantC += coolantRate * dt
+            if coolantC >= 120 {
+                coolantC = 120
+                coolantRising = false
+            }
+        } else {
+            coolantC -= coolantRate * dt
+            if coolantC <= 50 {
+                coolantC = 50
+                coolantRising = true
+            }
+        }
 
-        // Intake temp follows ambient + engine bay heat
-        intakeC = approach(intakeC, 18 + loadPct * 0.22, rate: 0.6, dt: dt)
+        // Intake sweep: 20 -> 80 -> 20
+        let intakeRate = 5.0
+        if intakeRising {
+            intakeC += intakeRate * dt
+            if intakeC >= 80 {
+                intakeC = 80
+                intakeRising = false
+            }
+        } else {
+            intakeC -= intakeRate * dt
+            if intakeC <= 20 {
+                intakeC = 20
+                intakeRising = true
+            }
+        }
 
         // MAF scales with rpm and load (g/s-ish)
-        maf = clamp(approach(maf, (rpm / 900) * (1.0 + loadPct / 100) * 2.4, rate: 2.2, dt: dt), 2, 200)
+        maf = clamp(
+            approach(maf, (rpm / 900) * (1.0 + loadPct / 100) * 2.4, rate: 2.2, dt: dt),
+            2,
+            200
+        )
 
         // Voltage: alternator kicks in when "running"
         let vTarget = rpm > 900 ? 13.9 : 12.4
@@ -119,12 +153,12 @@ final class MOCKComm: CommProtocol {
         logger.info("Sending command: \(command, privacy: .public)")
         var header = ""
 
-        // ✅ advance simulator each command so values evolve smoothly
+        // advance simulator each command so values evolve smoothly
         MockVehicleSim.shared.step()
 
         let prefix = String(command.prefix(2))
 
-        // MARK: - Modes 01 / 06 / 09 framing (your existing implementation)
+        // MARK: - Modes 01 / 06 / 09 framing
         if prefix == "01" || prefix == "06" || prefix == "09" {
             var response: String = ""
             if ecuSettings.headerOn {
@@ -202,7 +236,7 @@ final class MOCKComm: CommProtocol {
             }
         }
 
-        // MARK: - AT commands (ELM handshake) ✅ KEEP THIS
+        // MARK: - AT commands (ELM handshake)
         else if command.hasPrefix("AT") {
             let action = command.dropFirst(2)
             var response = {
@@ -226,7 +260,6 @@ final class MOCKComm: CommProtocol {
                 case "DPN":
                     return ["06"]
                 case "RV":
-                    // Use simulator voltage (stable) instead of random
                     let v = MockVehicleSim.shared.voltage
                     return [String(format: "%.2f", v)]
                 default:
@@ -240,7 +273,7 @@ final class MOCKComm: CommProtocol {
             return response
         }
 
-        // MARK: - Mode 03 (DTCs) ✅ KEEP THIS
+        // MARK: - Mode 03 (DTCs)
         else if command == "03" {
             if ecuSettings.headerOn {
                 header = "7E8"
@@ -363,7 +396,7 @@ extension OBDCommand {
             case .status:
                 return "01 12 34 56 78 00"
 
-            case .controlModuleVoltage:   // PID 0x42
+            case .controlModuleVoltage:
                 // volts = (256*A + B) / 1000
                 let raw = Int(sim.voltage * 1000.0)
                 let A = raw / 256
@@ -408,17 +441,14 @@ extension OBDCommand {
                 return "10 \(String(format: "%02X", A)) \(String(format: "%02X", B))"
 
             case .engineLoad:
-                // load% = (A*100)/255
                 let a = Int((sim.loadPct / 100.0) * 255.0)
                 return "04 \(String(format: "%02X", a))"
 
             case .throttlePos:
-                // throttle% = (A*100)/255
                 let a = Int((sim.loadPct / 100.0) * 255.0)
                 return "11 \(String(format: "%02X", a))"
 
             case .fuelLevel:
-                // fuel% = (A*100)/255
                 let a = Int((sim.fuelPct / 100.0) * 255.0)
                 return "2F \(String(format: "%02X", a))"
 
@@ -426,7 +456,6 @@ extension OBDCommand {
                 let a = Int(sim.intakeC.rounded()) + 40
                 return "0F \(String(format: "%02X", a))"
 
-            // Keep the rest as your existing random-ish values (or add more sim later)
             case .fuelPressure:
                 let pressure = Int.random(in: 0...765)
                 let hexPressure = String(format: "%02X", pressure / 3)
@@ -448,8 +477,7 @@ extension OBDCommand {
                 return "33 \(hexPressure)"
 
             case .engineOilTemp:
-                // correlate loosely with coolant
-                let oil = min(130, max(40, Int(sim.coolantC + Double.random(in: 5...20))))
+                let oil = min(130, max(40, Int(sim.coolantC + 12)))
                 let hex = String(format: "%02X", oil + 40)
                 return "5C \(hex)"
 
@@ -495,7 +523,7 @@ extension OBDCommand {
 
 extension String {
     func chunked(by chunkSize: Int) -> Array<String> {
-        return stride(from: 0, to: self.count, by: chunkSize).map {
+        stride(from: 0, to: self.count, by: chunkSize).map {
             String(
                 self[self.index(self.startIndex, offsetBy: $0)..<self.index(self.startIndex, offsetBy: min($0 + chunkSize, self.count))]
             )
