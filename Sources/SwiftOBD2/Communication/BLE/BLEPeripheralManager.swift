@@ -8,12 +8,13 @@ protocol BLEPeripheralManagerDelegate: AnyObject {
 }
 
 class BLEPeripheralManager: NSObject, ObservableObject {
-    func didWriteValue(_ peripheral: CBPeripheral, descriptor: CBDescriptor, error: (any Error)?) {
-
-    }
-
     @Published var connectedPeripheral: CBPeripheral?
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.example.app", category: "BLEPeripheralManager")
+
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.example.app",
+        category: "BLEPeripheralManager"
+    )
+
     private let characteristicHandler: BLECharacteristicHandler
 
     weak var delegate: BLEPeripheralManagerDelegate?
@@ -51,6 +52,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     }
 
     func didDiscoverServices(_ peripheral: CBPeripheral, error: Error?) {
+        if let error {
+            logger.error("Error discovering services: \(error.localizedDescription)")
+            connectionCompletion?(nil, error)
+            return
+        }
+
         for service in peripheral.services ?? [] {
             logger.info("Discovered service: \(service.uuid.uuidString)")
             characteristicHandler.discoverCharacteristics(for: service, on: peripheral)
@@ -68,17 +75,14 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         characteristicHandler.setupCharacteristics(characteristics, on: peripheral)
 
-        // Check if all required characteristics are set up
         if characteristicHandler.isReady {
             connectionCompletion?(peripheral, nil)
             connectionCompletion = nil
-
-            // Notify delegate
             delegate?.peripheralManager(self, didSetupCharacteristics: peripheral)
         }
     }
 
-    func didUpdateValue(_: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+    func didUpdateValue(_ peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
             logger.error("Error reading characteristic value: \(error.localizedDescription)")
             return
@@ -86,6 +90,20 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         guard let data = characteristic.value else { return }
         characteristicHandler.handleUpdatedValue(data, from: characteristic)
+    }
+
+    func didWriteValue(_ peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+        characteristicHandler.handleDidWriteValue(for: characteristic, error: error)
+    }
+
+    func didUpdateNotificationState(_ peripheral: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
+        characteristicHandler.handleDidUpdateNotificationState(for: characteristic, error: error)
+
+        if characteristicHandler.isReady, connectionCompletion != nil, let connectedPeripheral {
+            connectionCompletion?(connectedPeripheral, nil)
+            connectionCompletion = nil
+            delegate?.peripheralManager(self, didSetupCharacteristics: connectedPeripheral)
+        }
     }
 }
 
@@ -100,5 +118,13 @@ extension BLEPeripheralManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         didUpdateValue(peripheral, characteristic: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        didWriteValue(peripheral, characteristic: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        didUpdateNotificationState(peripheral, characteristic: characteristic, error: error)
     }
 }
