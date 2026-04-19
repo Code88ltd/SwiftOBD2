@@ -3,7 +3,6 @@ import CoreBluetooth
 import Foundation
 import OSLog
 
-/// Protocol for BLE connection operations
 protocol BLEConnectionProtocol {
     var connectionState: ConnectionState { get }
     var connectedPeripheral: CBPeripheral? { get }
@@ -15,11 +14,18 @@ protocol BLEConnectionProtocol {
     func isReady() -> Bool
 }
 
-/// Focused component responsible for BLE connection management and service discovery
-class BLEConnection: NSObject, BLEConnectionProtocol {
-    // MARK: - Properties
+enum BLEAdapterProfile: String {
+    case obdLinkCX
+    case elmFFE0
+    case vgate18F0
+    case generic
+}
 
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.swiftobd2.app", category: "BLEConnection")
+class BLEConnection: NSObject, BLEConnectionProtocol {
+    private let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.swiftobd2.app",
+        category: "BLEConnection"
+    )
 
     private weak var centralManager: CBCentralManager?
     private let supportedServices: [CBUUID]
@@ -27,15 +33,13 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var connectedPeripheral: CBPeripheral?
 
-    // Characteristics for OBD communication
     var ecuReadCharacteristic: CBCharacteristic?
     var ecuWriteCharacteristic: CBCharacteristic?
 
-    // Connection management
+    private var adapterProfile: BLEAdapterProfile = .generic
+
     private var connectionCompletion: ((CBPeripheral?, Error?) -> Void)?
     private var connectionTimeout: Task<Void, Never>?
-
-    // MARK: - Publishers
 
     var connectionStatePublisher: AnyPublisher<ConnectionState, Never> {
         $connectionState.eraseToAnyPublisher()
@@ -45,7 +49,18 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         $connectedPeripheral.eraseToAnyPublisher()
     }
 
-    // MARK: - Initialization
+    // Full UUIDs to make CX handling explicit
+    static let cxService = CBUUID(string: "0000FFF0-0000-1000-8000-00805F9B34FB")
+    static let cxNotify = CBUUID(string: "0000FFF1-0000-1000-8000-00805F9B34FB")
+    static let cxWrite  = CBUUID(string: "0000FFF2-0000-1000-8000-00805F9B34FB")
+
+    static let defaultServices = [
+        BLEConnection.cxService,
+        CBUUID(string: "FFE0"),
+        CBUUID(string: "18F0"),
+        CBUUID(string: "FFF0"),
+        CBUUID(string: "FFF1")
+    ]
 
     init(centralManager: CBCentralManager, supportedServices: [CBUUID] = BLEConnection.defaultServices) {
         self.centralManager = centralManager
@@ -53,15 +68,6 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         super.init()
         logger.debug("BLEConnection initialized with services: \(supportedServices.map(\.uuidString))")
     }
-
-    static let defaultServices = [
-        CBUUID(string: "FFE0"),
-        CBUUID(string: "FFF0"),
-        CBUUID(string: "18F0"), // e.g. VGate iCar Pro
-          CBUUID(string: "FFF1"),
-    ]
-
-    // MARK: - Connection Management
 
     func connect(to peripheral: CBPeripheral, timeout: TimeInterval = 10.0) async throws {
         guard let centralManager = centralManager else {
@@ -82,23 +88,19 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
             seconds: timeout,
             timeoutError: BLEConnectionError.connectionTimeout,
             onTimeout: { [weak self] in
-                // Clean up on timeout - but don't call connectionCompletion as it will try to resume an already-handled continuation
                 if let completion = self?.connectionCompletion {
                     completion(nil, BLEConnectionError.connectionTimeout)
                 }
                 self?.logger.error("Connection timed out after \(timeout) seconds")
                 centralManager.cancelPeripheralConnection(peripheral)
                 self?.resetConnectionState()
-                // Clear the completion handler to prevent double-resuming
                 self?.connectionCompletion = nil
             },
             operation: {
-                // Main connection task
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     var hasResumed = false
 
                     self.connectionCompletion = { [weak self] connectedPeripheral, error in
-                        // Ensure we only resume once
                         guard !hasResumed else {
                             self?.logger.debug("Connection completion called but continuation already resumed")
                             return
@@ -120,14 +122,12 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
                         self?.connectionCompletion = nil
                     }
 
-                    // Start connection
                     peripheral.delegate = self
                     centralManager.connect(peripheral, options: [
                         CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
                         CBConnectPeripheralOptionNotifyOnConnectionKey: true,
                     ])
 
-                    // Stop scanning to avoid interference
                     if centralManager.isScanning {
                         centralManager.stopScan()
                         self.logger.debug("Stopped scanning to focus on connection")
@@ -152,37 +152,31 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         let hasReadChar = ecuReadCharacteristic != nil
         let hasWriteChar = ecuWriteCharacteristic != nil
 
-        // Accept if we have at least one characteristic, or if read/write are the same (like FFE1)
-        let hasCharacteristics = hasReadChar && (hasWriteChar || ecuReadCharacteristic == ecuWriteCharacteristic)
+        switch adapterProfile {
+        case .obdLinkCX:
+            logger.debug("isReady CX - Connection: \(hasConnection), Read: \(hasReadChar), Write: \(hasWriteChar)")
+            return hasConnection && hasReadChar && hasWriteChar
 
-        logger.debug("isReady check - Connection: \(hasConnection), Read: \(hasReadChar), Write: \(hasWriteChar), Same: \(self.ecuReadCharacteristic == self.ecuWriteCharacteristic)")
+        case .elmFFE0:
+            let sameChar = ecuReadCharacteristic == ecuWriteCharacteristic
+            logger.debug("isReady ELM FFE0 - Connection: \(hasConnection), Read: \(hasReadChar), Write: \(hasWriteChar), Same: \(sameChar)")
+            return hasConnection && hasReadChar && (hasWriteChar || sameChar)
 
-        return hasConnection && hasCharacteristics
+        case .vgate18F0, .generic:
+            let sameChar = ecuReadCharacteristic == ecuWriteCharacteristic
+            logger.debug("isReady Generic - Connection: \(hasConnection), Read: \(hasReadChar), Write: \(hasWriteChar), Same: \(sameChar)")
+            return hasConnection && hasReadChar && (hasWriteChar || sameChar)
+        }
     }
-
-    // MARK: - Internal Connection Handling
 
     func handleDidConnect(_ peripheral: CBPeripheral) {
         logger.info("Connected to peripheral: \(peripheral.name ?? "Unnamed")")
         connectedPeripheral = peripheral
         connectionState = .connectedToAdapter
 
-        // Start service discovery with timeout
-        peripheral.discoverServices(supportedServices)
+        // Ask for all services first so we can detect the profile reliably
+        peripheral.discoverServices(nil)
 
-//        // Set up a timeout for service discovery
-//        connectionTimeout = Task { [weak self] in
-//            try? await Task.sleep(nanoseconds: UInt64(5.0 * 1_000_000_000)) // 5 second timeout for service discovery
-//            await MainActor.run {
-//                if self?.connectionCompletion != nil {
-//                    self?.logger.warning("Service discovery timed out, but connection may still be usable")
-//                    // Complete connection even if not all characteristics found
-//                    self?.connectionCompletion?(peripheral, nil)
-//                }
-//            }
-//        }
-
-        // Save last connected peripheral
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: "lastConnectedPeripheral")
     }
 
@@ -200,66 +194,42 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         let errorMessage = error?.localizedDescription ?? "Unknown error"
         logger.error("Failed to connect to peripheral: \(errorMessage)")
 
-        // Only call completion if it hasn't been cleared by timeout
         if let completion = connectionCompletion {
             completion(nil, error ?? BLEConnectionError.connectionFailed)
         } else {
-            logger.debug("Connection failure handled but completion was already cleared (likely by timeout)")
+            logger.debug("Connection failure handled but completion was already cleared")
         }
     }
-
-    // MARK: - Service and Characteristic Discovery
 
     func handleDidDiscoverServices(_ peripheral: CBPeripheral, error: Error?) {
         if let error = error {
             logger.error("Service discovery failed: \(error.localizedDescription)")
             connectionTimeout?.cancel()
-            // Only call completion if it hasn't been cleared by timeout
-            if let completion = connectionCompletion {
-                completion(nil, error)
-            } else {
-                logger.debug("Service discovery failure handled but completion was already cleared (likely by timeout)")
-            }
+            connectionCompletion?(nil, error)
             return
         }
 
         guard let services = peripheral.services, !services.isEmpty else {
             logger.error("No services found on peripheral")
             connectionTimeout?.cancel()
-            // Only call completion if it hasn't been cleared by timeout
-            if let completion = connectionCompletion {
-                completion(nil, BLEConnectionError.noServicesFound)
-            } else {
-                logger.debug("No services found but completion was already cleared (likely by timeout)")
-            }
+            connectionCompletion?(nil, BLEConnectionError.noServicesFound)
             return
         }
 
         logger.info("Discovered \(services.count) services")
-        var compatibleServices = 0
+
+        adapterProfile = determineProfile(from: services)
+        logger.info("Detected adapter profile: \(adapterProfile.rawValue)")
 
         for service in services {
             logger.info("Discovered service: \(service.uuid.uuidString)")
-            if supportedServices.contains(service.uuid) {
-                compatibleServices += 1
-                discoverCharacteristicsForService(service, on: peripheral)
-            } else {
-                logger.debug("Service \(service.uuid.uuidString) not in supported list, skipping")
-            }
-        }
-
-        if compatibleServices == 0 {
-            logger.warning("No compatible services found, but continuing anyway")
-            // Still try to discover characteristics for all services as fallback
-            for service in services {
-                discoverCharacteristicsForService(service, on: peripheral)
-            }
+            discoverCharacteristicsForService(service, on: peripheral)
         }
     }
 
     func handleDidDiscoverCharacteristics(_ peripheral: CBPeripheral, service: CBService, error: Error?) {
         if let error = error {
-            logger.error("Characteristic discovery failed: \(error.localizedDescription)")
+            logger.error("Characteristic discovery failed for \(service.uuid.uuidString): \(error.localizedDescription)")
             return
         }
 
@@ -272,38 +242,43 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
             configureCharacteristic(characteristic, on: peripheral)
         }
 
-        // Check if we have required characteristics (more flexible approach)
-        let hasReadCharacteristic = ecuReadCharacteristic != nil
-        let hasWriteCharacteristic = ecuWriteCharacteristic != nil
-
-        // For some adapters, the same characteristic handles both read/write (like FFE1)
-        if hasReadCharacteristic && (hasWriteCharacteristic || ecuReadCharacteristic == ecuWriteCharacteristic) {
-            logger.info("Required characteristics discovered and configured")
-            connectionTimeout?.cancel() // Cancel timeout since we succeeded
+        if isReady() {
+            logger.info("Required characteristics discovered and configured for profile: \(adapterProfile.rawValue)")
+            connectionTimeout?.cancel()
             connectionTimeout = nil
-            // Only call completion if it hasn't been cleared by timeout
-            if let completion = connectionCompletion {
-                completion(peripheral, nil)
-            } else {
-                logger.debug("Characteristics discovered but completion was already cleared (likely by timeout)")
-            }
-        } else {
-            logger.debug("Still waiting for characteristics - Read: \(hasReadCharacteristic), Write: \(hasWriteCharacteristic)")
+            connectionCompletion?(peripheral, nil)
         }
     }
 
-    // MARK: - Private Helper Methods
+    private func determineProfile(from services: [CBService]) -> BLEAdapterProfile {
+        let uuids = Set(services.map { normalizedUUID($0.uuid) })
+
+        if uuids.contains("FFF0") {
+            return .obdLinkCX
+        }
+        if uuids.contains("FFE0") {
+            return .elmFFE0
+        }
+        if uuids.contains("18F0") {
+            return .vgate18F0
+        }
+        return .generic
+    }
 
     private func discoverCharacteristicsForService(_ service: CBService, on peripheral: CBPeripheral) {
+        let serviceUUID = normalizedUUID(service.uuid)
         let characteristicUUIDs: [CBUUID]
 
-        switch service.uuid {
-        case CBUUID(string: "FFE0"):
+        switch serviceUUID {
+        case "FFF0":
+            characteristicUUIDs = [Self.cxNotify, Self.cxWrite]
+
+        case "FFE0":
             characteristicUUIDs = [CBUUID(string: "FFE1")]
-        case CBUUID(string: "FFF0"):
-            characteristicUUIDs = [CBUUID(string: "FFF1"), CBUUID(string: "FFF2")]
-        case CBUUID(string: "18F0"):
+
+        case "18F0":
             characteristicUUIDs = [CBUUID(string: "2AF0"), CBUUID(string: "2AF1")]
+
         default:
             characteristicUUIDs = []
         }
@@ -312,65 +287,130 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
     }
 
     private func configureCharacteristic(_ characteristic: CBCharacteristic, on peripheral: CBPeripheral) {
-        let uuid = characteristic.uuid.uuidString.uppercased()
+        let uuid = normalizedUUID(characteristic.uuid)
         let properties = characteristic.properties
 
-        logger.debug("Configuring characteristic \(uuid) with properties: \(String(describing: properties))")
+        logger.debug("Configuring characteristic \(uuid) with properties: \(String(describing: properties)) for profile \(adapterProfile.rawValue)")
 
-        // Enable notifications if supported
-        if properties.contains(.notify) {
-            peripheral.setNotifyValue(true, for: characteristic)
-            logger.debug("Enabled notifications for characteristic: \(uuid)")
+        switch adapterProfile {
+        case .obdLinkCX:
+            configureForOBDLinkCX(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
+
+        case .elmFFE0:
+            configureForFFE0(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
+
+        case .vgate18F0:
+            configureFor18F0(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
+
+        case .generic:
+            configureGeneric(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
+        }
+    }
+
+    private func configureForOBDLinkCX(
+        _ characteristic: CBCharacteristic,
+        uuid: String,
+        properties: CBCharacteristicProperties,
+        peripheral: CBPeripheral
+    ) {
+        switch uuid {
+        case "FFF1":
+            ecuReadCharacteristic = characteristic
+            if properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+            logger.info("Configured FFF1 as notify/read characteristic")
+
+        case "FFF2":
+            ecuWriteCharacteristic = characteristic
+            logger.info("Configured FFF2 as write characteristic")
+
+        default:
+            logger.debug("Ignoring non-CX characteristic \(uuid)")
+        }
+    }
+
+    private func configureForFFE0(
+        _ characteristic: CBCharacteristic,
+        uuid: String,
+        properties: CBCharacteristicProperties,
+        peripheral: CBPeripheral
+    ) {
+        if uuid == "FFE1" {
+            ecuReadCharacteristic = characteristic
+            ecuWriteCharacteristic = characteristic
+
+            if properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
+
+            logger.info("Configured FFE1 as both read and write characteristic")
+            return
         }
 
-        // Assign characteristics based on UUID and properties
+        configureGeneric(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
+    }
+
+    private func configureFor18F0(
+        _ characteristic: CBCharacteristic,
+        uuid: String,
+        properties: CBCharacteristicProperties,
+        peripheral: CBPeripheral
+    ) {
         switch uuid {
-        case "FFE1": // For service FFE0 - typically both read/write
-            ecuWriteCharacteristic = characteristic
+        case "2AF0":
             ecuReadCharacteristic = characteristic
-            logger.info("Configured FFE1 as both read and write characteristic")
-
-        case "FFF1": // For service FFF0 - typically read
-            if properties.contains(.read) || properties.contains(.notify) {
-                ecuReadCharacteristic = characteristic
-                logger.info("Configured FFF1 as read characteristic")
+            if properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: characteristic)
             }
-
-        case "FFF2": // For service FFF0 - typically write
-            if properties.contains(.write) || properties.contains(.writeWithoutResponse) {
-                ecuWriteCharacteristic = characteristic
-                logger.info("Configured FFF2 as write characteristic")
-            }
-
-        case "2AF0": // For service 18F0 - typically read
-            ecuReadCharacteristic = characteristic
             logger.info("Configured 2AF0 as read characteristic")
 
-        case "2AF1": // For service 18F0 - typically write
+        case "2AF1":
             ecuWriteCharacteristic = characteristic
             logger.info("Configured 2AF1 as write characteristic")
 
         default:
-            logger.debug("Unknown characteristic \(uuid), attempting auto-assignment based on properties")
-
-            // Fallback: auto-assign based on properties if we don't have characteristics yet
-            if ecuReadCharacteristic == nil && (properties.contains(.read) || properties.contains(.notify)) {
-                ecuReadCharacteristic = characteristic
-                logger.info("Auto-assigned \(uuid) as read characteristic based on properties")
-            }
-
-            if ecuWriteCharacteristic == nil && (properties.contains(.write) || properties.contains(.writeWithoutResponse)) {
-                ecuWriteCharacteristic = characteristic
-                logger.info("Auto-assigned \(uuid) as write characteristic based on properties")
-            }
-
-            // If it supports both, assign as both (like FFE1)
-            if properties.contains(.read) && properties.contains(.write) && ecuReadCharacteristic == nil && ecuWriteCharacteristic == nil {
-                ecuReadCharacteristic = characteristic
-                ecuWriteCharacteristic = characteristic
-                logger.info("Auto-assigned \(uuid) as both read and write characteristic")
-            }
+            configureGeneric(characteristic, uuid: uuid, properties: properties, peripheral: peripheral)
         }
+    }
+
+    private func configureGeneric(
+        _ characteristic: CBCharacteristic,
+        uuid: String,
+        properties: CBCharacteristicProperties,
+        peripheral: CBPeripheral
+    ) {
+        if properties.contains(.notify), ecuReadCharacteristic == nil {
+            ecuReadCharacteristic = characteristic
+            peripheral.setNotifyValue(true, for: characteristic)
+            logger.info("Auto-assigned \(uuid) as notify/read characteristic")
+        } else if properties.contains(.read), ecuReadCharacteristic == nil {
+            ecuReadCharacteristic = characteristic
+            logger.info("Auto-assigned \(uuid) as read characteristic")
+        }
+
+        if (properties.contains(.write) || properties.contains(.writeWithoutResponse)),
+           ecuWriteCharacteristic == nil {
+            ecuWriteCharacteristic = characteristic
+            logger.info("Auto-assigned \(uuid) as write characteristic")
+        }
+
+        if ecuReadCharacteristic == nil,
+           ecuWriteCharacteristic == nil,
+           properties.contains(.read),
+           properties.contains(.write) {
+            ecuReadCharacteristic = characteristic
+            ecuWriteCharacteristic = characteristic
+            logger.info("Auto-assigned \(uuid) as both read and write characteristic")
+        }
+    }
+
+    private func normalizedUUID(_ uuid: CBUUID) -> String {
+        let s = uuid.uuidString.uppercased()
+        if s.hasPrefix("0000"), s.hasSuffix("-0000-1000-8000-00805F9B34FB") {
+            return String(s.dropFirst(4).prefix(4))
+        }
+        return s
     }
 
     private func resetConnectionState() {
@@ -378,12 +418,11 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         ecuWriteCharacteristic = nil
         connectedPeripheral = nil
         connectionState = .disconnected
+        adapterProfile = .generic
         connectionCompletion = nil
         connectionTimeout?.cancel()
         connectionTimeout = nil
     }
-
-    // MARK: - Cleanup
 
     deinit {
         disconnect()
@@ -391,8 +430,6 @@ class BLEConnection: NSObject, BLEConnectionProtocol {
         logger.debug("BLEConnection deinitialized")
     }
 }
-
-// MARK: - CBPeripheralDelegate
 
 extension BLEConnection: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -404,21 +441,17 @@ extension BLEConnection: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        // Forward data updates to the central manager's delegate (BLEManager)
         if let centralManager = centralManager, let delegate = centralManager.delegate as? CBPeripheralDelegate {
             delegate.peripheral?(peripheral, didUpdateValueFor: characteristic, error: error)
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        // Forward write confirmations to the central manager's delegate (BLEManager)
         if let centralManager = centralManager, let delegate = centralManager.delegate as? CBPeripheralDelegate {
             delegate.peripheral?(peripheral, didWriteValueFor: characteristic, error: error)
         }
     }
 }
-
-// MARK: - Error Types
 
 enum BLEConnectionError: Error, LocalizedError, Equatable {
     case centralManagerNotAvailable
