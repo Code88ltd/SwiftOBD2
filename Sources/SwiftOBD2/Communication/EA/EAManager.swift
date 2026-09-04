@@ -84,6 +84,27 @@ public final class EAManager:
     private var isDisconnecting =
         false
 
+    // MARK: - Raw Stream Access
+
+    /*
+     Generic low-level receive callback.
+
+     This deliberately knows nothing about:
+
+     - Porsche
+     - KWP2000
+     - STMA
+     - Durametric
+
+     Higher-level transports can temporarily use
+     this when they need continuous raw adapter
+     output instead of normal prompt-based command
+     processing.
+    */
+
+    public var rawReceiveHandler:
+        ((Data) -> Void)?
+
     // MARK: - Logging Helper
 
     private func post(
@@ -179,13 +200,6 @@ public final class EAManager:
         EAAccessoryManager
             .shared()
             .unregisterForLocalNotifications()
-
-        /*
-         IMPORTANT:
-
-         Do not asynchronously dispatch back onto
-         stateQueue during deinit.
-        */
 
         performDisconnectCleanup(
             notifyDelegate:
@@ -357,6 +371,9 @@ public final class EAManager:
         buffer
             .removeAll()
 
+        rawReceiveHandler =
+            nil
+
         let completion =
             messageCompletion
 
@@ -449,17 +466,6 @@ public final class EAManager:
 
     // MARK: - Raw Command
 
-    /*
-     Public intentionally.
-
-     TrackPulse's Porsche K-Line service can use
-     this method directly without invoking
-     OBDService / protocol detection / PID
-     discovery.
-
-     This is transport only.
-    */
-
     public func sendCommand(
         _ command:
             String,
@@ -532,16 +538,6 @@ public final class EAManager:
         for attempt in 1...attemptCount {
 
             do {
-
-                /*
-                 Clear stale data before sending a
-                 fresh command.
-
-                 This prevents bytes left over from
-                 an earlier adapter command being
-                 interpreted as the response to the
-                 new K-Line command.
-                */
 
                 stateQueue
                     .sync {
@@ -627,6 +623,82 @@ public final class EAManager:
         ??
         BLEManagerError
             .unknownError
+    }
+
+    // MARK: - Generic Raw Send
+
+    /*
+     Sends bytes directly to the External
+     Accessory stream.
+
+     Unlike sendCommand(), this:
+
+     - does not append CR
+     - does not clear the response buffer
+     - does not wait for ">"
+     - does not perform retries
+
+     This is intentionally generic so protocols
+     requiring streaming behaviour can implement
+     it outside SwiftOBD2.
+    */
+
+    public func sendRaw(
+        _ data:
+            Data
+    ) throws {
+
+        guard
+            connectionState
+                == .connectedToAdapter,
+            output != nil
+        else {
+
+            post(
+                .warning,
+                "sendRaw blocked (not ready)",
+                meta: [
+                    "state":
+                        "\(connectionState)",
+
+                    "hasOutput":
+                        "\(output != nil)",
+
+                    "bytes":
+                        "\(data.count)"
+                ]
+            )
+
+            throw BLEManagerError
+                .missingPeripheralOrCharacteristic
+        }
+
+        post(
+            .debug,
+            "TX RAW",
+            meta: [
+                "bytes":
+                    "\(data.count)",
+
+                "hex":
+                    data
+                        .map {
+                            String(
+                                format:
+                                    "%02X",
+                                $0
+                            )
+                        }
+                        .joined(
+                            separator:
+                                " "
+                        )
+            ]
+        )
+
+        try writeRaw(
+            data
+        )
     }
 
     // MARK: - Open EA Session
@@ -730,19 +802,12 @@ public final class EAManager:
         return true
     }
 
-    // MARK: - Write
+    // MARK: - Write Command
 
     private func writeCommand(
         _ command:
             String
     ) throws {
-
-        guard let output
-        else {
-
-            throw BLEManagerError
-                .missingPeripheralOrCharacteristic
-        }
 
         guard
             let data =
@@ -765,6 +830,25 @@ public final class EAManager:
                     command
             ]
         )
+
+        try writeRaw(
+            data
+        )
+    }
+
+    // MARK: - Write Raw
+
+    private func writeRaw(
+        _ data:
+            Data
+    ) throws {
+
+        guard let output
+        else {
+
+            throw BLEManagerError
+                .missingPeripheralOrCharacteristic
+        }
 
         try data
             .withUnsafeBytes { ptr in
@@ -793,6 +877,13 @@ public final class EAManager:
 
                     while !output
                         .hasSpaceAvailable {
+
+                        if let streamError =
+                            output
+                                .streamError {
+
+                            throw streamError
+                        }
 
                         Thread
                             .sleep(
@@ -1011,14 +1102,36 @@ public final class EAManager:
                 break
             }
 
+            let received =
+                Data(
+                    tmp[0..<n]
+                )
+
+            /*
+             If a higher-level transport has
+             requested raw receive access, give it
+             the bytes exactly as received.
+
+             In raw mode we intentionally bypass
+             normal prompt-based parsing.
+            */
+
+            if let rawReceiveHandler {
+
+                rawReceiveHandler(
+                    received
+                )
+
+                continue
+            }
+
             stateQueue
                 .async {
 
                     self
                         .buffer
                         .append(
-                            contentsOf:
-                                tmp[0..<n]
+                            received
                         )
 
                     guard
@@ -1060,6 +1173,14 @@ public final class EAManager:
                                     separatedBy:
                                         .newlines
                                 )
+                                .flatMap {
+
+                                    $0
+                                        .components(
+                                            separatedBy:
+                                                "\r"
+                                        )
+                                }
                                 .map {
 
                                     $0
